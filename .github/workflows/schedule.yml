@@ -21,10 +21,13 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        TODAY=$(date -u +%F)
-        COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/schedule.yml/runs?per_page=50" --jq "[.workflow_runs[] | select(.created_at >= \"${TODAY}\") | select(.id != ${GITHUB_RUN_ID})] | length")
+        # 用北京时间计算"今天"的 00:00 对应的 UTC 时间戳
+        TODAY_BEIJING=$(TZ=Asia/Shanghai date +%F)
+        TODAY_UTC=$(date -u -d "${TODAY_BEIJING}T00:00:00+08:00" +%Y-%m-%dT%H:%M:%SZ)
+        # 用 run-logs artifact 判断今天是否已真正发送（只有真正发送的运行才会产生此 artifact）
+        COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq "[.artifacts[] | select(.name == \"run-logs\") | select(.created_at >= \"${TODAY_UTC}\")] | length")
         echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
-        echo "今日已成功的运行次数(不含本次): ${COUNT}"
+        echo "北京时间今天(${TODAY_BEIJING})已成功发送的次数: ${COUNT}"
     - name: Set up Python
       if: steps.check.outputs.count == '0'
       uses: actions/setup-python@v4
