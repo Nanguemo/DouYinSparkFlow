@@ -30,6 +30,79 @@ jobs:
         TODAY_BEIJING=$(date +%F)
         TODAY_UTC=$(date -u -d "${TODAY_BEIJING}T00:00:00+08:00" +%Y-%m-%dT%H:%M:%SZ)
         # 用 run-logs artifact 判断今天是否已真正发送（只有真正发送的运行才会产生此 artifact）
+        COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "run-logs") | select(.created_at >= "${TODAY_UTC}")] | length')
+        echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+        echo "北京时间今天(${TODAY_BEIJING})已成功发送的次数: ${COUNT}"
+    - name: Set up Python
+      if: steps.check.outputs.count == '0'
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    - name: Test Douyin Accessibility
+      if: steps.check.outputs.count == '0'
+      run: |
+        curl -I https://creator.douyin.com/
+    - name: Install dependencies
+      if: steps.check.outputs.count == '0'
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    - name: Ensure browsers are installed
+      if: steps.check.outputs.count == '0'
+      run: playwright install chromium --with-deps --only-shell
+    - name: Export Github Environment Variables and Secrets to JSON
+      if: steps.check.outputs.count == '0'
+      env:
+        VARS_JSON: ${{ toJson(vars) }}
+        SECRETS_JSON: ${{ toJson(secrets) }}
+      run: python utils/export_github_env.py
+    - name: Run DouYin Spark Flow
+      if: steps.check.outputs.count == '0'
+      run: python main.py
+    - uses: actions/upload-artifact@v4
+      if: ${{ !cancelled() && steps.check.outputs.count == '0' }}
+      with:
+        name: run-logs
+        path: logs/
+  workflow-keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: liskin/gh-workflow-keepalive@v1
+name: DouYin Spark Flow Schedule Run
+on:
+  workflow_dispatch: # 允许手动触发
+  schedule: # 定时任务（每 3 小时一次，共 8 个时间点，避免 GitHub 调度延迟）
+    - cron: "15 17 * * *" # UTC 17:15 = 北京 1:15
+    - cron: "15 20 * * *" # UTC 20:15 = 北京 4:15
+    - cron: "15 23 * * *" # UTC 23:15 = 北京 7:15
+    - cron: "15 2 * * *" # UTC 02:15 = 北京 10:15
+    - cron: "15 5 * * *" # UTC 05:15 = 北京 13:15
+    - cron: "15 8 * * *" # UTC 08:15 = 北京 16:15
+    - cron: "15 11 * * *" # UTC 11:15 = 北京 19:15
+    - cron: "15 14 * * *" # UTC 14:15 = 北京 22:15
+jobs:
+  run-main:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    environment: user-data
+    permissions:
+      actions: read
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check if already succeeded today
+      id: check
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TZ: Asia/Shanghai
+      run: |
+        # 用北京时间计算"今天"的 00:00 对应的 UTC 时间戳
+        TODAY_BEIJING=$(date +%F)
+        TODAY_UTC=$(date -u -d "${TODAY_BEIJING}T00:00:00+08:00" +%Y-%m-%dT%H:%M:%SZ)
+        # 用 run-logs artifact 判断今天是否已真正发送（只有真正发送的运行才会产生此 artifact）
         COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq "[.artifacts[] | select(.name == \"run-logs\") | select(.created_at >= "${TODAY_UTC}\")] | length")
         echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
         echo "北京时间今天(${TODAY_BEIJING})已成功发送的次数: ${COUNT}"
