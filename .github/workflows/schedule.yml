@@ -2,14 +2,22 @@ name: DouYin Spark Flow Schedule Run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 17 * * *"
-    - cron: "15 20 * * *"
-    - cron: "15 23 * * *"
-    - cron: "15 2 * * *"
-    - cron: "15 5 * * *"
-    - cron: "15 8 * * *"
-    - cron: "15 11 * * *"
-    - cron: "15 14 * * *"
+    - cron: "15 17 * * *"→ Runs at 17:15
+
+    - cron: "15 20 * * *"→ Runs at 20:15
+
+    - cron: "15 23 * * *"→ Runs at 23:15
+
+    - cron: "15 2 * * *"→ Runs at 02:15
+
+    - cron: "15 5 * * *"→ Runs at 05:15
+
+    - cron: "15 8 * * *"→ Runs at 08:15
+
+    - cron: "15 11 * * *"→ Runs at 11:15
+
+    - cron: "15 14 * * *"→ Runs at 14:15
+
 jobs:
   run-main:
     timeout-minutes: 20
@@ -28,7 +36,7 @@ jobs:
       run: |
         TODAY_BEIJING=$(date +%F)
         TODAY_UTC=$(date -u -d "${TODAY_BEIJING}T00:00:00+08:00" +%Y-%m-%dT%H:%M:%SZ)
-        COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "run-logs") | select(.created_at >= "${TODAY_UTC}")] | length')
+        COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "run-logs") | select(.created_at >= ""$TODAY_UTC"")] | length')
         echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
         echo "Beijing today(${TODAY_BEIJING}) count: ${COUNT}"
     - name: Set up Python
