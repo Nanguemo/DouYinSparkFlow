@@ -24,9 +24,10 @@ jobs:
       id: check
       env:
         GH_TOKEN: ${{ github.token }}
+        TZ: Asia/Shanghai
       run: |
         # 用北京时间计算"今天"的 00:00 对应的 UTC 时间戳
-        TODAY_BEIJING=$(TZ=Asia/Shanghai date +%F)
+        TODAY_BEIJING=$(date +%F)
         TODAY_UTC=$(date -u -d "${TODAY_BEIJING}T00:00:00+08:00" +%Y-%m-%dT%H:%M:%SZ)
         # 用 run-logs artifact 判断今天是否已真正发送（只有真正发送的运行才会产生此 artifact）
         COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq "[.artifacts[] | select(.name == \"run-logs\") | select(.created_at >= "${TODAY_UTC}\")] | length")
