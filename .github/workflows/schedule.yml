@@ -1,11 +1,15 @@
 name: DouYin Spark Flow Schedule Run
 on:
   workflow_dispatch: # 允许手动触发
-  schedule: # 定时任务（主触发+兜底触发，防止 GitHub 调度跳过）
-    - cron: "15 0 * * *" # 每天 00:15 UTC（北京 8:15）主触发
-    - cron: "10 3 * * *" # 每天 03:10 UTC（北京 11:10）兜底
-    - cron: "30 5 * * *" # 每天 05:30 UTC（北京 13:30）兜底
-    - cron: "45 11 * * *" # 每天 11:45 UTC（北京 19:45）兜底
+  schedule: # 定时任务（每 3 小时一次，共 8 个时间点，避免 GitHub 调度延迟）
+    - cron: "15 17 * * *" # UTC 17:15 = 北京 1:15
+    - cron: "15 20 * * *" # UTC 20:15 = 北京 4:15
+    - cron: "15 23 * * *" # UTC 23:15 = 北京 7:15
+    - cron: "15 2 * * *" # UTC 02:15 = 北京 10:15
+    - cron: "15 5 * * *" # UTC 05:15 = 北京 13:15
+    - cron: "15 8 * * *" # UTC 08:15 = 北京 16:15
+    - cron: "15 11 * * *" # UTC 11:15 = 北京 19:15
+    - cron: "15 14 * * *" # UTC 14:15 = 北京 22:15
 jobs:
   run-main:
     timeout-minutes: 20
@@ -25,7 +29,7 @@ jobs:
         TODAY_BEIJING=$(TZ=Asia/Shanghai date +%F)
         TODAY_UTC=$(date -u -d "${TODAY_BEIJING}T00:00:00+08:00" +%Y-%m-%dT%H:%M:%SZ)
         # 用 run-logs artifact 判断今天是否已真正发送（只有真正发送的运行才会产生此 artifact）
-        COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq "[.artifacts[] | select(.name == \"run-logs\") | select(.created_at >= \"${TODAY_UTC}\")] | length")
+        COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq "[.artifacts[] | select(.name == \"run-logs\") | select(.created_at >= "${TODAY_UTC}\")] | length")
         echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
         echo "北京时间今天(${TODAY_BEIJING})已成功发送的次数: ${COUNT}"
     - name: Set up Python
