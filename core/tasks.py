@@ -95,32 +95,102 @@ def scroll_conversation_list(page, username, max_scrolls=15):
     empty_scroll_count = 0
     MAX_EMPTY_SCROLLS = 10
 
+    # 先等待会话列表出现（短超时，避免卡死）
+    try:
+        page.wait_for_selector(scrollable_friends_selector, timeout=30000)
+    except Exception:
+        logger.warning(f"账号 {username} 未找到会话列表容器（30秒超时），可能页面未完全加载")
+        return
+
     for _ in range(max_scrolls):
-        scrollable_element = page.locator(scrollable_friends_selector).element_handle()
+        try:
+            scrollable_element = page.query_selector(scrollable_friends_selector)
+        except Exception:
+            scrollable_element = None
         if not scrollable_element:
             logger.warning(f"账号 {username} 未找到滚动容器")
             break
 
-        scroll_top_before = page.evaluate(
-            "(element) => element.scrollTop", scrollable_element
-        )
-        page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
-        time.sleep(0.3)
-        scroll_top_after = page.evaluate(
-            "(element) => element.scrollTop", scrollable_element
-        )
+        try:
+            scroll_top_before = page.evaluate(
+                "(element) => element.scrollTop", scrollable_element
+            )
+            page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
+            time.sleep(0.3)
+            scroll_top_after = page.evaluate(
+                "(element) => element.scrollTop", scrollable_element
+            )
 
-        if scroll_top_before == scroll_top_after:
-            empty_scroll_count += 2
-        else:
-            empty_scroll_count = 0
-            logger.debug(f"账号 {username} 滚动好友列表 (scrollTop: {scroll_top_before} -> {scroll_top_after})")
+            if scroll_top_before == scroll_top_after:
+                empty_scroll_count += 2
+            else:
+                empty_scroll_count = 0
+                logger.debug(f"账号 {username} 滚动好友列表 (scrollTop: {scroll_top_before} -> {scroll_top_after})")
 
-        if empty_scroll_count >= MAX_EMPTY_SCROLLS:
-            logger.debug(f"账号 {username} 滚动完成，共收集到 {len(userIDDict)} 个好友")
+            if empty_scroll_count >= MAX_EMPTY_SCROLLS:
+                logger.debug(f"账号 {username} 滚动完成，共收集到 {len(userIDDict)} 个好友")
+                break
+
+            time.sleep(1.5)
+        except Exception as e:
+            logger.warning(f"账号 {username} 滚动过程出错: {e}")
             break
 
-        time.sleep(1.5)
+
+def fetch_friends_via_api(page):
+    """通过 API 获取好友列表（fallback 方案）"""
+    global userIDDict
+    logger.info("尝试通过 API 获取好友信息")
+
+    # 尝试调用会话列表 API
+    result = page.evaluate("""
+        async () => {
+            const urls = [
+                '/aweme/v1/web/im/conversation/list/',
+                '/aweme/v1/web/im/user/info/',
+            ];
+            for (const url of urls) {
+                try {
+                    const resp = await fetch(url, {credentials: 'include'});
+                    if (resp.ok) {
+                        return {url: url, data: await resp.json()};
+                    }
+                } catch (e) {
+                    // 尝试下一个 URL
+                }
+            }
+            return null;
+        }
+    """)
+
+    if not result:
+        logger.warning("API 获取好友信息失败：所有端点均返回空")
+        return
+
+    data = result.get("data", {})
+    logger.info(f"API 返回数据（{result.get('url')}）")
+
+    # 解析返回数据
+    items = data.get("data", []) or data.get("conversations", [])
+    for item in items:
+        uid = item.get("uid", "") or item.get("to_uid", "")
+        short_id = item.get("short_id", "")
+        unique_id = item.get("unique_id", "")
+        sec_uid = item.get("sec_uid", "")
+        nickname = norm(item.get("nickname", ""))
+        remark_name = norm(item.get("remark_name", nickname))
+
+        if remark_name and uid:
+            userIDDict[remark_name] = {
+                "uid": uid,
+                "short_id": short_id,
+                "unique_id": unique_id,
+                "sec_uid": sec_uid,
+                "nickname": nickname,
+                "remark_name": remark_name,
+            }
+
+    logger.info(f"通过 API 收集到 {len(userIDDict)} 个好友信息")
 
 
 def extract_user_info_from_page(page):
@@ -236,17 +306,23 @@ def do_user_task_ws(browser, username, cookies, targets):
     # 注入 Cookie
     context.add_cookies(cookies)
 
-    # 打开聊天页面
+    # 打开聊天页面（用 domcontentloaded 避免 SPA load 超时）
     retry_operation(
         "打开抖音网页聊天页面",
         page.goto,
         retries=config["taskRetryTimes"],
         delay=5,
         url="https://www.douyin.com/chat",
+        wait_until="domcontentloaded",
     )
 
     logger.info(f"账号 {username} 聊天页面已打开，等待加载...")
-    time.sleep(5)
+    # 等待网络空闲和 JS 渲染
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except Exception:
+        logger.warning("等待 networkidle 超时，继续执行")
+    time.sleep(10)  # 给 JS 足够时间渲染会话列表
 
     # 滚动会话列表收集好友信息
     scroll_conversation_list(page, username)
@@ -254,6 +330,14 @@ def do_user_task_ws(browser, username, cookies, targets):
 
     # 提取当前用户信息
     extract_user_info_from_page(page)
+
+    # 如果没有收集到好友信息，尝试通过 API 获取
+    if not userIDDict:
+        logger.warning(f"账号 {username} 未通过滚动收集到好友信息，尝试通过 API 获取")
+        try:
+            fetch_friends_via_api(page)
+        except Exception as e:
+            logger.warning(f"通过 API 获取好友信息失败: {e}")
 
     # 关闭浏览器（不再需要 UI）
     context.close()
