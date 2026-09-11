@@ -72,6 +72,3 @@ jobs:
       actions: write
     steps:
       - uses: liskin/gh-workflow-keepalive@v1
-     
-  fix: restore valid YAML syntax for schedule workflow     
-    
