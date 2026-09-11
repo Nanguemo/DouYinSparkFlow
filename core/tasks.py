@@ -31,25 +31,37 @@ def handle_response(response: Response):
 
     url = response.url
 
-    # 好友信息接口
-    if "aweme/v1/web/im/user/info" in url:
+    # 会话列表接口（主要好友信息来源）
+    if "aweme/v1/web/im/conversation/list" in url:
         try:
             json_data = response.json()
-            for item in json_data.get("data", []):
-                uid = item.get("uid", "")  # 用户 UID（数字 ID，用于 WebSocket）
-                short_id = item.get("short_id", "")  # short_id
-                unique_id = item.get("unique_id", "")  # unique_id
-                sec_uid = item.get("sec_uid", "")  # sec_uid
-                nickname = norm(item.get("nickname"))  # 昵称
-                remark_name = norm(item.get("remark_name", nickname))  # 备注名
-                userIDDict[remark_name] = {
-                    "uid": uid,
-                    "short_id": short_id,
-                    "unique_id": unique_id,
-                    "sec_uid": sec_uid,
-                    "nickname": nickname,
-                    "remark_name": remark_name,
-                }
+            if not isinstance(json_data, dict):
+                return
+            # 尝试多种可能的响应结构
+            items = (
+                json_data.get("data", []) or
+                json_data.get("conversations", []) or
+                json_data.get("conversation_list", []) or
+                []
+            )
+            logger.debug(f"会话列表 API 返回 {len(items)} 条会话")
+            for item in items:
+                _parse_conversation_item(item)
+        except Exception as e:
+            logger.warning(f"解析会话列表响应失败: {e}")
+
+    # 好友信息接口
+    elif "aweme/v1/web/im/user/info" in url:
+        try:
+            json_data = response.json()
+            if not isinstance(json_data, dict):
+                return
+            data_list = json_data.get("data", [])
+            if data_list is None:
+                logger.debug(f"用户信息 API 返回空 data 字段")
+                return
+            for item in data_list:
+                _parse_user_info_item(item)
         except Exception as e:
             logger.warning(f"解析好友信息响应失败: {e}")
 
@@ -57,18 +69,98 @@ def handle_response(response: Response):
     elif "aweme/v1/web/query/user" in url or "aweme/v1/web/im/user/me" in url:
         try:
             json_data = response.json()
-            # 提取 uid
-            uid = json_data.get("uid", "") or json_data.get("user", {}).get("uid", "")
+            if not isinstance(json_data, dict):
+                return
+            logger.debug(f"用户信息 API 响应 keys: {list(json_data.keys())}")
+            # id 字段是用户 UID（抖音 API 的 id 即用户账号 UID）
+            uid = (
+                json_data.get("uid", "") or
+                json_data.get("user", {}).get("uid", "") or
+                json_data.get("id", "") or
+                json_data.get("user", {}).get("id", "")
+            )
             if uid:
                 myUserInfo["uid"] = str(uid)
                 logger.debug(f"捕获到当前用户 uid: {uid}")
-            # 提取 device_id
-            device_id = json_data.get("id", "") or json_data.get("device_id", "")
+            # device_id 从专门字段获取
+            device_id = (
+                json_data.get("device_id", "") or
+                json_data.get("user", {}).get("device_id", "")
+            )
             if device_id:
                 myUserInfo["device_id"] = str(device_id)
                 logger.debug(f"捕获到 device_id: {device_id}")
         except Exception as e:
             logger.warning(f"解析当前用户信息响应失败: {e}")
+
+
+def _parse_conversation_item(item: dict):
+    """解析会话列表项，提取好友信息"""
+    global userIDDict
+    if not isinstance(item, dict):
+        return
+
+    uid = (
+        item.get("to_uid", "") or
+        item.get("uid", "") or
+        item.get("user_id", "") or
+        ""
+    )
+    # 从 ext 字段提取好友信息
+    ext = item.get("ext", {}) or {}
+    if isinstance(ext, str):
+        try:
+            ext = json.loads(ext)
+        except:
+            ext = {}
+
+    nickname = norm(ext.get("nickname", "") or item.get("nickname", ""))
+    remark_name = norm(ext.get("remark_name", "") or item.get("remark_name", nickname))
+    short_id = ext.get("short_id", "") or item.get("short_id", "")
+    unique_id = ext.get("unique_id", "") or item.get("unique_id", "")
+    sec_uid = ext.get("sec_uid", "") or item.get("sec_uid", "")
+
+    # 如果没有 uid，尝试从 conversation_id 解析
+    if not uid:
+        conv_id = item.get("conversation_id", "") or item.get("conversation_short_id", "")
+        if conv_id and ":" in str(conv_id):
+            parts = str(conv_id).split(":")
+            if len(parts) >= 3:
+                uid = parts[2]
+
+    if remark_name and uid:
+        userIDDict[remark_name] = {
+            "uid": uid,
+            "short_id": short_id,
+            "unique_id": unique_id,
+            "sec_uid": sec_uid,
+            "nickname": nickname,
+            "remark_name": remark_name,
+        }
+
+
+def _parse_user_info_item(item: dict):
+    """解析用户信息项，提取好友信息"""
+    global userIDDict
+    if not isinstance(item, dict):
+        return
+
+    uid = item.get("uid", "") or item.get("id", "")
+    short_id = item.get("short_id", "")
+    unique_id = item.get("unique_id", "")
+    sec_uid = item.get("sec_uid", "")
+    nickname = norm(item.get("nickname", ""))
+    remark_name = norm(item.get("remark_name", nickname))
+
+    if remark_name and uid:
+        userIDDict[remark_name] = {
+            "uid": uid,
+            "short_id": short_id,
+            "unique_id": unique_id,
+            "sec_uid": sec_uid,
+            "nickname": nickname,
+            "remark_name": remark_name,
+        }
 
 
 def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
@@ -95,39 +187,158 @@ def scroll_conversation_list(page, username, max_scrolls=15):
     empty_scroll_count = 0
     MAX_EMPTY_SCROLLS = 10
 
+    # 先等待会话列表出现（短超时，避免卡死）
+    try:
+        page.wait_for_selector(scrollable_friends_selector, timeout=30000)
+    except Exception:
+        logger.warning(f"账号 {username} 未找到会话列表容器（30秒超时），可能页面未完全加载")
+        return
+
     for _ in range(max_scrolls):
-        scrollable_element = page.locator(scrollable_friends_selector).element_handle()
+        try:
+            scrollable_element = page.query_selector(scrollable_friends_selector)
+        except Exception:
+            scrollable_element = None
         if not scrollable_element:
             logger.warning(f"账号 {username} 未找到滚动容器")
             break
 
-        scroll_top_before = page.evaluate(
-            "(element) => element.scrollTop", scrollable_element
-        )
-        page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
-        time.sleep(0.3)
-        scroll_top_after = page.evaluate(
-            "(element) => element.scrollTop", scrollable_element
-        )
+        try:
+            scroll_top_before = page.evaluate(
+                "(element) => element.scrollTop", scrollable_element
+            )
+            page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
+            time.sleep(0.3)
+            scroll_top_after = page.evaluate(
+                "(element) => element.scrollTop", scrollable_element
+            )
 
-        if scroll_top_before == scroll_top_after:
-            empty_scroll_count += 2
-        else:
-            empty_scroll_count = 0
-            logger.debug(f"账号 {username} 滚动好友列表 (scrollTop: {scroll_top_before} -> {scroll_top_after})")
+            if scroll_top_before == scroll_top_after:
+                empty_scroll_count += 2
+            else:
+                empty_scroll_count = 0
+                logger.debug(f"账号 {username} 滚动好友列表 (scrollTop: {scroll_top_before} -> {scroll_top_after})")
 
-        if empty_scroll_count >= MAX_EMPTY_SCROLLS:
-            logger.debug(f"账号 {username} 滚动完成，共收集到 {len(userIDDict)} 个好友")
+            if empty_scroll_count >= MAX_EMPTY_SCROLLS:
+                logger.debug(f"账号 {username} 滚动完成，共收集到 {len(userIDDict)} 个好友")
+                break
+
+            time.sleep(1.5)
+        except Exception as e:
+            logger.warning(f"账号 {username} 滚动过程出错: {e}")
             break
 
-        time.sleep(1.5)
+
+def fetch_friends_via_api(page):
+    """通过 API 获取好友列表（fallback 方案）"""
+    global userIDDict
+    logger.info("尝试通过 API 获取好友信息")
+
+    # 尝试调用会话列表 API（带分页参数）
+    result = page.evaluate("""
+        async () => {
+            const results = [];
+            const apis = [
+                {
+                    url: '/aweme/v1/web/im/conversation/list/',
+                    params: 'inbox_type=0&cursor=0&limit=50',
+                },
+                {
+                    url: '/aweme/v1/web/im/conversation/list/',
+                    params: 'inbox_type=1&cursor=0&limit=50',
+                },
+            ];
+            for (const api of apis) {
+                try {
+                    const resp = await fetch(api.url + '?' + api.params, {
+                        credentials: 'include',
+                        headers: {'Accept': 'application/json'}
+                    });
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        results.push({url: api.url, params: api.params, data: data});
+                    }
+                } catch (e) {}
+            }
+            return results.length > 0 ? results : null;
+        }
+    """)
+
+    if not result:
+        logger.warning("API 获取好友信息失败：所有端点均返回空")
+        return
+
+    for api_result in result:
+        api_url = api_result.get("url", "")
+        data = api_result.get("data", {})
+
+        # 记录响应结构帮助调试
+        if isinstance(data, dict):
+            logger.debug(f"API {api_url} 返回 keys: {list(data.keys())}")
+
+        # 尝试多种可能的响应结构
+        items = (
+            data.get("data", []) or
+            data.get("conversations", []) or
+            data.get("conversation_list", []) or
+            []
+        )
+
+        if not items:
+            logger.debug(f"API {api_url} 未返回会话列表数据")
+            continue
+
+        logger.info(f"API {api_url} 返回 {len(items)} 条会话数据")
+
+        for item in items:
+            # 会话项结构: {conversation_id, to_uid, ext: {nickname, remark_name, ...}}
+            uid = (
+                item.get("to_uid", "") or
+                item.get("uid", "") or
+                item.get("user_id", "") or
+                ""
+            )
+            # 从 ext 字段提取好友信息
+            ext = item.get("ext", {}) or {}
+            if isinstance(ext, str):
+                try:
+                    ext = json.loads(ext)
+                except:
+                    ext = {}
+
+            nickname = norm(ext.get("nickname", "") or item.get("nickname", ""))
+            remark_name = norm(ext.get("remark_name", "") or item.get("remark_name", nickname))
+
+            short_id = ext.get("short_id", "") or item.get("short_id", "")
+            unique_id = ext.get("unique_id", "") or item.get("unique_id", "")
+            sec_uid = ext.get("sec_uid", "") or item.get("sec_uid", "")
+
+            # 如果没有 uid，尝试从 conversation_id 解析
+            if not uid:
+                conv_id = item.get("conversation_id", "") or item.get("conversation_short_id", "")
+                if conv_id and ":" in str(conv_id):
+                    parts = str(conv_id).split(":")
+                    if len(parts) >= 3:
+                        uid = parts[2]  # "0:1:{toid}:{myid}" 中的 toid
+
+            if remark_name and uid:
+                userIDDict[remark_name] = {
+                    "uid": uid,
+                    "short_id": short_id,
+                    "unique_id": unique_id,
+                    "sec_uid": sec_uid,
+                    "nickname": nickname,
+                    "remark_name": remark_name,
+                }
+
+    logger.info(f"通过 API 收集到 {len(userIDDict)} 个好友信息")
 
 
 def extract_user_info_from_page(page):
     """从页面 JS 上下文提取当前用户的 uid 和 device_id"""
     global myUserInfo
 
-    # 方法1: 尝试从页面全局变量获取
+    # 方法1: 尝试从页面全局变量和 localStorage 获取
     try:
         result = page.evaluate("""
             () => {
@@ -136,19 +347,26 @@ def extract_user_info_from_page(page):
                 if (window.__INITIAL_STATE__) {
                     const state = window.__INITIAL_STATE__;
                     if (state.user) {
-                        info.uid = state.user.uid || state.user.userId || '';
+                        info.uid = state.user.uid || state.user.userId || state.user.id || '';
                     }
                     if (state.deviceId) info.deviceId = state.deviceId;
                 }
-                // 尝试从 localStorage 获取
+                // 尝试从 localStorage 获取 uid 和 device_id
                 for (let i = 0; i < localStorage.length; i++) {
                     const key = localStorage.key(i);
                     try {
                         const val = localStorage.getItem(key);
-                        if (val && val.includes('"uid"')) {
+                        if (!val) continue;
+                        // 直接匹配 device_id 键
+                        if (key === 'device_id' || key === 'deviceId') {
+                            info.deviceId = val;
+                        }
+                        // 解析 JSON 值
+                        if (val.includes('"uid"') || val.includes('"device_id"')) {
                             const parsed = JSON.parse(val);
                             if (parsed.uid) info.uid = String(parsed.uid);
-                            if (parsed.device_id) info.deviceId = parsed.device_id;
+                            if (parsed.device_id) info.deviceId = String(parsed.device_id);
+                            if (parsed.user && parsed.user.uid) info.uid = String(parsed.user.uid);
                         }
                     } catch {}
                 }
@@ -169,28 +387,78 @@ def extract_user_info_from_page(page):
         try:
             result = page.evaluate("""
                 async () => {
-                    try {
-                        const resp = await fetch('/aweme/v1/web/query/user', {
-                            credentials: 'include',
-                            headers: {'Accept': 'application/json'}
-                        });
-                        if (resp.ok) {
-                            return await resp.json();
-                        }
-                    } catch (e) {}
+                    const urls = [
+                        '/aweme/v1/web/query/user',
+                        '/aweme/v1/web/im/user/me',
+                    ];
+                    for (const url of urls) {
+                        try {
+                            const resp = await fetch(url, {
+                                credentials: 'include',
+                                headers: {'Accept': 'application/json'}
+                            });
+                            if (resp.ok) {
+                                const data = await resp.json();
+                                return {url: url, data: data};
+                            }
+                        } catch (e) {}
+                    }
                     return null;
                 }
             """)
             if result:
-                uid = result.get("uid", "")
-                device_id = result.get("id", "")
+                api_url = result.get("url", "")
+                data = result.get("data", {})
+                logger.debug(f"API {api_url} 返回数据 keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+
+                # id 字段是用户 UID（不是 device_id）
+                uid = (
+                    data.get("uid", "") or
+                    data.get("user", {}).get("uid", "") or
+                    data.get("id", "") or
+                    data.get("user", {}).get("id", "")
+                )
                 if uid:
                     myUserInfo["uid"] = str(uid)
+                    logger.debug(f"从 API 获取到 uid: {uid}")
+
+                # device_id 需要从其他字段获取
+                device_id = (
+                    data.get("device_id", "") or
+                    data.get("user", {}).get("device_id", "")
+                )
                 if device_id:
                     myUserInfo["device_id"] = str(device_id)
-                logger.debug(f"从 API 获取到 uid={uid}, device_id={device_id}")
+                    logger.debug(f"从 API 获取到 device_id: {device_id}")
         except Exception as e:
             logger.debug(f"通过 API 获取用户信息失败: {e}")
+
+    # 方法3: 如果仍然没有 device_id，从 localStorage 单独提取
+    if not myUserInfo.get("device_id"):
+        try:
+            device_id = page.evaluate("""
+                () => {
+                    // 常见的 device_id 存储 key
+                    const keys = ['device_id', 'deviceId', 'tt_device_id', 'fpid'];
+                    for (const key of keys) {
+                        const val = localStorage.getItem(key);
+                        if (val) return val;
+                    }
+                    // 从 cookie 中提取 ttwid 作为 fallback
+                    const match = document.cookie.match(/ttwid=([^;]+)/);
+                    return match ? match[1] : '';
+                }
+            """)
+            if device_id:
+                myUserInfo["device_id"] = str(device_id)
+                logger.debug(f"从 localStorage 提取到 device_id: {device_id}")
+        except Exception as e:
+            logger.debug(f"从 localStorage 提取 device_id 失败: {e}")
+
+    # 方法4: 如果有 uid 但没有 device_id，用 uid 作为 device_id（部分场景可用）
+    if myUserInfo.get("uid") and not myUserInfo.get("device_id"):
+        myUserInfo["device_id"] = myUserInfo["uid"]
+        logger.debug(f"使用 uid 作为 device_id fallback: {myUserInfo['uid']}")
 
 
 def find_target_uid(target, cookies):
@@ -209,6 +477,123 @@ def find_target_uid(target, cookies):
 
     logger.warning(f"未在会话列表中找到目标 {target}，可能不是近期聊天好友")
     return None, None
+
+
+def search_friend_by_name(page, target_name):
+    """通过抖音聊天页面搜索功能查找好友 uid"""
+    global userIDDict
+    logger.info(f"尝试搜索好友: {target_name}")
+
+    try:
+        # 尝试找到搜索输入框
+        search_selectors = [
+            'input[placeholder*="搜索"]',
+            'input[placeholder*="search"]',
+            'input[data-testid*="search"]',
+            '.search-input input',
+            'input[type="text"]',
+        ]
+
+        search_input = None
+        for selector in search_selectors:
+            try:
+                search_input = page.wait_for_selector(selector, timeout=5000)
+                if search_input:
+                    logger.debug(f"找到搜索输入框: {selector}")
+                    break
+            except:
+                continue
+
+        if not search_input:
+            logger.warning(f"未找到搜索输入框")
+            return None
+
+        # 清空并输入搜索内容
+        search_input.click()
+        search_input.fill("")
+        search_input.type(target_name)
+        time.sleep(3)  # 等待搜索结果
+
+        # 捕获搜索 API 响应（通过 handle_response 自动处理）
+        time.sleep(2)
+
+        # 检查是否在 userIDDict 中找到了目标
+        for remark_name, info in userIDDict.items():
+            if target_name in [info["remark_name"], info["nickname"]]:
+                uid = info.get("uid", "")
+                if uid:
+                    logger.info(f"搜索找到好友 {target_name} (uid={uid})")
+                    return uid, info
+
+        # 清空搜索框
+        search_input.fill("")
+        time.sleep(1)
+
+    except Exception as e:
+        logger.warning(f"搜索好友 {target_name} 失败: {e}")
+
+    return None, None
+
+
+def search_friends_via_api(page, targets):
+    """通过 API 搜索好友（需要 X-Bogus 签名，可能在页面内 fetch 不需要）"""
+    global userIDDict
+    found_count = 0
+
+    for target in targets:
+        if target in [info.get("remark_name") for info in userIDDict.values()]:
+            continue  # 已找到
+
+        try:
+            # 使用页面内 fetch 调用搜索 API
+            result = page.evaluate(f"""
+                async () => {{
+                    try {{
+                        const resp = await fetch(
+                            '/aweme/v1/web/general/search/single/?keyword=' + 
+                            encodeURIComponent('{target}') + 
+                            '&count=10&search_source=normal&is_full_text=1',
+                            {{credentials: 'include'}}
+                        );
+                        if (resp.ok) return await resp.json();
+                    }} catch (e) {{}}
+                    return null;
+                }}
+            """)
+
+            if not result or not isinstance(result, dict):
+                continue
+
+            # 解析搜索结果
+            data = result.get("data", [])
+            for item in data:
+                user = item.get("user", {}) or item
+                uid = user.get("uid", "") or user.get("id", "")
+                nickname = norm(user.get("nickname", ""))
+                short_id = user.get("short_id", "")
+                unique_id = user.get("unique_id", "")
+                sec_uid = user.get("sec_uid", "")
+                remark_name = norm(user.get("remark_name", nickname))
+
+                if target in [nickname, remark_name, unique_id, short_id] and uid:
+                    userIDDict[remark_name] = {
+                        "uid": uid,
+                        "short_id": short_id,
+                        "unique_id": unique_id,
+                        "sec_uid": sec_uid,
+                        "nickname": nickname,
+                        "remark_name": remark_name,
+                    }
+                    found_count += 1
+                    logger.info(f"API 搜索找到好友 {target} (uid={uid})")
+                    break
+
+            time.sleep(1)  # 搜索间隔
+
+        except Exception as e:
+            logger.debug(f"API 搜索 {target} 失败: {e}")
+
+    return found_count
 
 
 def do_user_task_ws(browser, username, cookies, targets):
@@ -236,17 +621,23 @@ def do_user_task_ws(browser, username, cookies, targets):
     # 注入 Cookie
     context.add_cookies(cookies)
 
-    # 打开聊天页面
+    # 打开聊天页面（用 domcontentloaded 避免 SPA load 超时）
     retry_operation(
         "打开抖音网页聊天页面",
         page.goto,
         retries=config["taskRetryTimes"],
         delay=5,
         url="https://www.douyin.com/chat",
+        wait_until="domcontentloaded",
     )
 
     logger.info(f"账号 {username} 聊天页面已打开，等待加载...")
-    time.sleep(5)
+    # 等待网络空闲和 JS 渲染
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except Exception:
+        logger.warning("等待 networkidle 超时，继续执行")
+    time.sleep(15)  # 给 JS 足够时间渲染会话列表
 
     # 滚动会话列表收集好友信息
     scroll_conversation_list(page, username)
@@ -254,6 +645,37 @@ def do_user_task_ws(browser, username, cookies, targets):
 
     # 提取当前用户信息
     extract_user_info_from_page(page)
+
+    # 如果没有收集到好友信息，尝试通过 API 获取
+    if not userIDDict:
+        logger.warning(f"账号 {username} 未通过滚动收集到好友信息，尝试通过 API 获取")
+        try:
+            fetch_friends_via_api(page)
+        except Exception as e:
+            logger.warning(f"通过 API 获取好友信息失败: {e}")
+
+    # 检查缺失的好友，尝试搜索
+    found_names = {info.get("remark_name") for info in userIDDict.values()}
+    missing_targets = [t for t in targets if t not in found_names]
+    if missing_targets:
+        logger.info(f"账号 {username} 有 {len(missing_targets)} 个好友未在会话列表中，尝试搜索")
+        # 先尝试 API 搜索
+        try:
+            found = search_friends_via_api(page, missing_targets)
+            if found > 0:
+                logger.info(f"通过 API 搜索找到 {found} 个好友")
+                missing_targets = [t for t in missing_targets
+                                   if t not in {info.get("remark_name") for info in userIDDict.values()}]
+        except Exception as e:
+            logger.debug(f"API 搜索失败: {e}")
+
+        # 再尝试页面搜索框
+        if missing_targets:
+            for target in missing_targets[:5]:  # 限制搜索数量避免超时
+                search_friend_by_name(page, target)
+                time.sleep(1)
+
+    logger.info(f"账号 {username} 最终收集到 {len(userIDDict)} 个好友信息")
 
     # 关闭浏览器（不再需要 UI）
     context.close()
