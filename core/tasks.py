@@ -6,11 +6,16 @@ from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
 from playwright.sync_api import Response
 import time
+import json
 
 config = get_config()
 userData = get_userData()
 logger = setup_logger(level=config.get("logLevel", "Info"))
+
+# 好友信息字典: remark_name -> {uid, short_id, unique_id, sec_uid, nickname, remark_name}
 userIDDict = {}
+# 当前用户信息: {uid, device_id}
+myUserInfo = {}
 
 CONVERSATION_ITEM_SELECTOR = ".conversationConversationItemwrapper"
 CONVERSATION_TITLE_SELECTOR = ".conversationConversationItemtitle"
@@ -20,41 +25,55 @@ CHAT_EDITOR_SELECTOR = ".messageEditorimChatEditorContainer"
 
 def handle_response(response: Response):
     """
-    只监听你要的那个接口响应
+    监听接口响应，收集好友完整信息和当前用户信息
     """
-    global userIDDict
-    # 精准匹配目标接口 URL
-    if "aweme/v1/web/im/user/info" in response.url:
-        # print(f"URL: {response.url}")
-        # print(f"状态码: {response.status}")
+    global userIDDict, myUserInfo
+
+    url = response.url
+
+    # 好友信息接口
+    if "aweme/v1/web/im/user/info" in url:
         try:
-            # 获取接口返回的 JSON 数据
             json_data = response.json()
-            # print("\n📦 响应 JSON 数据：")
-            # print(json.dumps(json_data, indent=4, ensure_ascii=False))
             for item in json_data.get("data", []):
-                short_id = item.get("short_id")  # short_id
-                unique_id = item.get("unique_id")  # unique_id
-                sec_uid = item.get("sec_uid", "")  # sec_uid 可能不存在，提供默认值为空字符串
+                uid = item.get("uid", "")  # 用户 UID（数字 ID，用于 WebSocket）
+                short_id = item.get("short_id", "")  # short_id
+                unique_id = item.get("unique_id", "")  # unique_id
+                sec_uid = item.get("sec_uid", "")  # sec_uid
                 nickname = norm(item.get("nickname"))  # 昵称
-                remark_name = norm(item.get("remark_name", nickname))  #  备注名，如果没有则使用昵称
-                userIDDict[remark_name] = [short_id, unique_id, sec_uid, nickname, remark_name]
+                remark_name = norm(item.get("remark_name", nickname))  # 备注名
+                userIDDict[remark_name] = {
+                    "uid": uid,
+                    "short_id": short_id,
+                    "unique_id": unique_id,
+                    "sec_uid": sec_uid,
+                    "nickname": nickname,
+                    "remark_name": remark_name,
+                }
         except Exception as e:
-            tb = traceback.extract_tb(e.__traceback__)
-            last = tb[-1]
-            print(f"解析响应失败: {e}")
-            print(f"文件: {last.filename}, 行号: {last.lineno}, 函数: {last.name}")
+            logger.warning(f"解析好友信息响应失败: {e}")
+
+    # 当前用户信息接口（多个可能的端点）
+    elif "aweme/v1/web/query/user" in url or "aweme/v1/web/im/user/me" in url:
+        try:
+            json_data = response.json()
+            # 提取 uid
+            uid = json_data.get("uid", "") or json_data.get("user", {}).get("uid", "")
+            if uid:
+                myUserInfo["uid"] = str(uid)
+                logger.debug(f"捕获到当前用户 uid: {uid}")
+            # 提取 device_id
+            device_id = json_data.get("id", "") or json_data.get("device_id", "")
+            if device_id:
+                myUserInfo["device_id"] = str(device_id)
+                logger.debug(f"捕获到 device_id: {device_id}")
+        except Exception as e:
+            logger.warning(f"解析当前用户信息响应失败: {e}")
 
 
 def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
     """
     通用的重试逻辑
-    :param name: 操作名称（用于日志记录）
-    :param operation: 要执行的异步操作
-    :param retries: 最大重试次数
-    :param delay: 每次重试之间的延迟（秒）
-    :param args: 传递给操作的参数
-    :param kwargs: 传递给操作的关键字参数
     """
     for attempt in range(retries):
         try:
@@ -67,172 +86,157 @@ def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
                 logger.error(f"{name} 失败，已达到最大重试次数，错误：{e}")
                 raise
 
-def checkTargetName(targetName, targets):
-    """检查targetName是否为目标
-    """
-    
-    targetSymbol = None
-    
-    targetName = norm(targetName)
-    
-    if targetName in userIDDict:
-        matched = next((v for v in userIDDict[targetName] if v and v in targets), None)
-        if matched is not None:
-            targetSymbol = matched
-    else:
-        if targetName in targets:
-            targetSymbol = targetName
-    return targetSymbol
 
+def scroll_conversation_list(page, username, max_scrolls=15):
+    """滚动会话列表，触发 API 调用以收集好友信息"""
+    logger.debug(f"账号 {username} 开始滚动会话列表收集好友信息")
 
-def scroll_and_select_user(page, username, targets):
-    """尝试滚动并查找用户名"""
-    # 定义目标元素和滚动容器的选择器
-    target_selector = CONVERSATION_ITEM_SELECTOR
     scrollable_friends_selector = CONVERSATION_LIST_SELECTOR
-
-    # [修复] 使用模糊匹配 no-more-tip- 前缀，不再依赖精确哈希后缀
-    # 同时增加文本匹配作为兜底
-    # no_more_selector = 'xpath=//div[contains(@class, "no-more-tip-")]'
-    # loading_selector = 'xpath=//div[contains(@class, "semi-spin")]'
-
-    logger.debug(f"账号 {username} 开始查找目标好友列表")
-    logger.debug(f"账号 {username} 目标好友列表: {targets}")
-
-    found_targets = set()
-    # [修改] 复制一份目标列表用于追踪进度
-    remaining_targets = set(targets)
-
-    # [修复] 新增：连续空滚动计数器（滚动后没有发现新好友的次数）
     empty_scroll_count = 0
-    MAX_EMPTY_SCROLLS = 10  # 连续10次滚动没有新好友，认为到底了
+    MAX_EMPTY_SCROLLS = 10
 
-    while True:
-        # 查找所有目标元素
-        target_elements = page.locator(target_selector).all()
+    for _ in range(max_scrolls):
+        scrollable_element = page.locator(scrollable_friends_selector).element_handle()
+        if not scrollable_element:
+            logger.warning(f"账号 {username} 未找到滚动容器")
+            break
 
-        # [修复] 记录本轮循环前已发现的好友数，用于判断是否有新发现
-        prev_found_count = len(found_targets)
+        scroll_top_before = page.evaluate(
+            "(element) => element.scrollTop", scrollable_element
+        )
+        page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
+        time.sleep(0.3)
+        scroll_top_after = page.evaluate(
+            "(element) => element.scrollTop", scrollable_element
+        )
 
-        for element in target_elements:
-            try:
-                # 查找子元素 span，模糊匹配 class
-                span = element.locator(CONVERSATION_TITLE_SELECTOR)
-                targetName = span.inner_text()
-
-                if targetName in found_targets:
-                    continue  # 已处理过，跳过
-                found_targets.add(targetName)
-
-                logger.debug(f"账号 {username} 找到好友 {targetName}")
-                
-                targetSymbol = checkTargetName(targetName, targets)
-
-                if targetSymbol:
-                    element.click()
-                    
-                    yield targetSymbol
-
-                    # [修改] 标记已找到，如果全找到了直接退出
-                    if targetSymbol in remaining_targets:
-                        remaining_targets.remove(targetSymbol)
-                    if len(remaining_targets) == 0:
-                        logger.debug(f"账号 {username} 所有目标好友均已找到，停止搜索")
-                        return
-                    break
-            except Exception as e:
-                traceback.print_exc()
+        if scroll_top_before == scroll_top_after:
+            empty_scroll_count += 2
         else:
-            # [修复] 检查本轮是否有新好友被发现
-            new_found = len(found_targets) > prev_found_count
-            if new_found:
-                empty_scroll_count = 0  # 有新发现，重置计数器
-            else:
-                empty_scroll_count += 1  # 无新发现，递增计数器
+            empty_scroll_count = 0
+            logger.debug(f"账号 {username} 滚动好友列表 (scrollTop: {scroll_top_before} -> {scroll_top_after})")
 
-            # [修复] 状态检测逻辑（多重兜底）
+        if empty_scroll_count >= MAX_EMPTY_SCROLLS:
+            logger.debug(f"账号 {username} 滚动完成，共收集到 {len(userIDDict)} 个好友")
+            break
 
-            # # 1. 检查是否到底（"没有更多了" —— 使用模糊类名匹配）
-            # if page.locator(no_more_selector).count() > 0:
-            #     logger.info(f"账号 {username} 检测到'没有更多了'标志，已到达底部")
-            #     if len(remaining_targets) > 0:
-            #         logger.warning(
-            #             f"账号 {username} 搜索结束，仍有以下好友未找到: {remaining_targets}"
-            #         )
-            #     break
-
-            # 2. [修复] 检查连续空滚动次数，防止死循环
-            if empty_scroll_count >= MAX_EMPTY_SCROLLS:
-                logger.warning(
-                    f"账号 {username} 连续 {MAX_EMPTY_SCROLLS} 次滚动未发现新好友，判定已到达底部"
-                )
-                if len(remaining_targets) > 0:
-                    logger.warning(
-                        f"账号 {username} 搜索结束，仍有以下好友未找到: {remaining_targets}"
-                    )
-                break
-
-            # 3. 检查是否正在加载
-            # if page.locator(loading_selector).count() > 0:
-            #     logger.debug(f"账号 {username} 列表正在加载中 (Loading)...")
-            #     time.sleep(1.5)  # 给加载留点时间
-            #     # 不 break，继续去滚动以触发后续内容
-
-            # 4. 滚动容器
-            scrollable_element = page.locator(
-                scrollable_friends_selector
-            ).element_handle()
-
-            if scrollable_element:
-                # [修复] 记录滚动前的 scrollTop，用于检测是否真的滚动了
-                scroll_top_before = page.evaluate(
-                    "(element) => element.scrollTop", scrollable_element
-                )
-
-                page.evaluate(
-                    "(element) => element.scrollTop += 800", scrollable_element
-                )
-
-                # [修复] 检测滚动后的 scrollTop
-                time.sleep(0.3)
-                scroll_top_after = page.evaluate(
-                    "(element) => element.scrollTop", scrollable_element
-                )
-
-                if scroll_top_before == scroll_top_after:
-                    # scrollTop 没有变化，说明已经到底了
-                    empty_scroll_count += 2  # 加速判定到底
-                    logger.debug(
-                        f"账号 {username} scrollTop 未变化 ({scroll_top_before})，可能已到底 (空滚动计数: {empty_scroll_count}/{MAX_EMPTY_SCROLLS})"
-                    )
-                else:
-                    logger.debug(
-                        f"账号 {username} 滚动好友列表以加载更多好友 (scrollTop: {scroll_top_before} -> {scroll_top_after})"
-                    )
-
-                time.sleep(1.5)
-            else:
-                logger.error(f"账号 {username} 未找到滚动容器，退出")
-                break
+        time.sleep(1.5)
 
 
-def do_user_task(browser, username, cookies, targets):
-    context = browser.new_context()  # 每个任务使用独立的上下文
-    context.set_default_navigation_timeout(
-        config["browserTimeout"]
-    )  # 设置导航超时时间为 120 秒
-    context.set_default_timeout(
-        config["browserTimeout"]
-    )  # 设置所有操作的默认超时时间为 120 秒
+def extract_user_info_from_page(page):
+    """从页面 JS 上下文提取当前用户的 uid 和 device_id"""
+    global myUserInfo
+
+    # 方法1: 尝试从页面全局变量获取
+    try:
+        result = page.evaluate("""
+            () => {
+                const info = {uid: '', deviceId: ''};
+                // 尝试从 __INITIAL_STATE__ 获取
+                if (window.__INITIAL_STATE__) {
+                    const state = window.__INITIAL_STATE__;
+                    if (state.user) {
+                        info.uid = state.user.uid || state.user.userId || '';
+                    }
+                    if (state.deviceId) info.deviceId = state.deviceId;
+                }
+                // 尝试从 localStorage 获取
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    try {
+                        const val = localStorage.getItem(key);
+                        if (val && val.includes('"uid"')) {
+                            const parsed = JSON.parse(val);
+                            if (parsed.uid) info.uid = String(parsed.uid);
+                            if (parsed.device_id) info.deviceId = parsed.device_id;
+                        }
+                    } catch {}
+                }
+                return info;
+            }
+        """)
+        if result.get("uid"):
+            myUserInfo["uid"] = str(result["uid"])
+            logger.debug(f"从页面 JS 提取到 uid: {result['uid']}")
+        if result.get("deviceId"):
+            myUserInfo["device_id"] = str(result["deviceId"])
+            logger.debug(f"从页面 JS 提取到 device_id: {result['deviceId']}")
+    except Exception as e:
+        logger.debug(f"从页面 JS 提取用户信息失败: {e}")
+
+    # 方法2: 尝试通过 fetch 调用 API 获取
+    if not myUserInfo.get("uid") or not myUserInfo.get("device_id"):
+        try:
+            result = page.evaluate("""
+                async () => {
+                    try {
+                        const resp = await fetch('/aweme/v1/web/query/user', {
+                            credentials: 'include',
+                            headers: {'Accept': 'application/json'}
+                        });
+                        if (resp.ok) {
+                            return await resp.json();
+                        }
+                    } catch (e) {}
+                    return null;
+                }
+            """)
+            if result:
+                uid = result.get("uid", "")
+                device_id = result.get("id", "")
+                if uid:
+                    myUserInfo["uid"] = str(uid)
+                if device_id:
+                    myUserInfo["device_id"] = str(device_id)
+                logger.debug(f"从 API 获取到 uid={uid}, device_id={device_id}")
+        except Exception as e:
+            logger.debug(f"通过 API 获取用户信息失败: {e}")
+
+
+def find_target_uid(target, cookies):
+    """根据目标名称查找好友的 uid"""
+    # 先在已收集的好友信息中查找
+    for remark_name, info in userIDDict.items():
+        # 匹配: 备注名、昵称、unique_id、short_id
+        if target in [info["remark_name"], info["nickname"],
+                       info["unique_id"], info["short_id"]]:
+            uid = info.get("uid", "")
+            if uid:
+                return uid, info
+            # uid 为空时用 short_id 作为 fallback
+            if info.get("short_id"):
+                return info["short_id"], info
+
+    logger.warning(f"未在会话列表中找到目标 {target}，可能不是近期聊天好友")
+    return None, None
+
+
+def do_user_task_ws(browser, username, cookies, targets):
+    """
+    WebSocket 方式发送消息：
+    1. 用浏览器打开聊天页面（仅用于认证和收集信息）
+    2. 滚动列表触发 API 调用，收集好友 uid
+    3. 提取当前用户 uid 和 device_id
+    4. 关闭浏览器
+    5. 通过 WebSocket + Protobuf 发送消息
+    """
+    global userIDDict, myUserInfo
+    # 每个用户重置状态
+    userIDDict = {}
+    myUserInfo = {}
+
+    # ========== 阶段1: 浏览器提取认证信息 ==========
+    context = browser.new_context()
+    context.set_default_navigation_timeout(config["browserTimeout"])
+    context.set_default_timeout(config["browserTimeout"])
 
     page = context.new_page()
-
-    page.on("response", handle_response)  # 监听响应，收集好友完整信息用于匹配
+    page.on("response", handle_response)
 
     # 注入 Cookie
     context.add_cookies(cookies)
 
-    # 打开抖音网页聊天页面
+    # 打开聊天页面
     retry_operation(
         "打开抖音网页聊天页面",
         page.goto,
@@ -241,58 +245,207 @@ def do_user_task(browser, username, cookies, targets):
         url="https://www.douyin.com/chat",
     )
 
-    time.sleep(5)  # 等待5秒让过可能存在的弹窗
+    logger.info(f"账号 {username} 聊天页面已打开，等待加载...")
+    time.sleep(5)
 
-    logger.debug(f"账号 {username} 开始发送消息")
-    # 滚动并选择用户
+    # 滚动会话列表收集好友信息
+    scroll_conversation_list(page, username)
+    logger.info(f"账号 {username} 共收集到 {len(userIDDict)} 个好友信息")
+
+    # 提取当前用户信息
+    extract_user_info_from_page(page)
+
+    # 关闭浏览器（不再需要 UI）
+    context.close()
+    logger.info(f"账号 {username} 浏览器阶段完成，已关闭")
+
+    # ========== 阶段2: WebSocket 发送消息 ==========
+    uid = myUserInfo.get("uid")
+    device_id = myUserInfo.get("device_id")
+
+    if not uid:
+        logger.error(f"账号 {username} 未能获取当前用户 uid，无法发送消息")
+        return
+
+    if not device_id:
+        logger.error(f"账号 {username} 未能获取 device_id，无法建立 WebSocket 连接")
+        return
+
+    logger.info(f"账号 {username} 当前用户 uid={uid}, device_id={device_id}")
+
+    # 导入 WebSocket 客户端
+    from core.ws_client import DouyinWSClient
+
+    # 创建 WebSocket 客户端
+    ws_client = DouyinWSClient(cookies, device_id, uid)
+
+    try:
+        # 建立 WebSocket 连接
+        ws_client.connect(timeout=15)
+        time.sleep(2)  # 等待连接稳定
+
+        # 向每个目标好友发送消息
+        message = build_message()
+        logger.debug(f"消息内容: {message}")
+
+        for target in targets:
+            toid, friend_info = find_target_uid(target, cookies)
+
+            if not toid:
+                logger.warning(f"账号 {username} 未找到好友 {target} 的 uid，跳过")
+                continue
+
+            logger.info(f"账号 {username} 开始发送消息给 {target} (uid={toid})")
+
+            try:
+                success = ws_client.send_message(toid, message, timeout=15)
+                if success:
+                    logger.info(f"✅ 账号 {username} 已发送消息给 {target}")
+                else:
+                    logger.warning(f"⚠️ 账号 {username} 发送消息给 {target} 可能失败")
+            except Exception as e:
+                logger.error(f"账号 {username} 发送消息给 {target} 失败: {e}")
+                traceback.print_exc()
+
+            time.sleep(2)  # 消息间隔
+
+    finally:
+        ws_client.close()
+        logger.info(f"账号 {username} WebSocket 连接已关闭")
+
+
+# ========== 以下为旧的 UI 自动化代码（保留作为 fallback）==========
+
+def checkTargetName(targetName, targets):
+    """检查targetName是否为目标"""
+    targetSymbol = None
+    targetName = norm(targetName)
+
+    if targetName in userIDDict:
+        info = userIDDict[targetName]
+        for v in [info.get("uid"), info.get("short_id"), info.get("unique_id")]:
+            if v and v in targets:
+                targetSymbol = v
+                break
+    else:
+        if targetName in targets:
+            targetSymbol = targetName
+    return targetSymbol
+
+
+def scroll_and_select_user(page, username, targets):
+    """尝试滚动并查找用户名（UI 方式，已弃用）"""
+    target_selector = CONVERSATION_ITEM_SELECTOR
+    scrollable_friends_selector = CONVERSATION_LIST_SELECTOR
+
+    found_targets = set()
+    remaining_targets = set(targets)
+    empty_scroll_count = 0
+    MAX_EMPTY_SCROLLS = 10
+
+    while True:
+        target_elements = page.locator(target_selector).all()
+        prev_found_count = len(found_targets)
+
+        for element in target_elements:
+            try:
+                span = element.locator(CONVERSATION_TITLE_SELECTOR)
+                targetName = span.inner_text()
+
+                if targetName in found_targets:
+                    continue
+                found_targets.add(targetName)
+
+                targetSymbol = checkTargetName(targetName, targets)
+                if targetSymbol:
+                    element.click()
+                    yield targetSymbol
+                    if targetSymbol in remaining_targets:
+                        remaining_targets.remove(targetSymbol)
+                    if len(remaining_targets) == 0:
+                        return
+                    break
+            except Exception as e:
+                traceback.print_exc()
+        else:
+            new_found = len(found_targets) > prev_found_count
+            if new_found:
+                empty_scroll_count = 0
+            else:
+                empty_scroll_count += 1
+
+            if empty_scroll_count >= MAX_EMPTY_SCROLLS:
+                if len(remaining_targets) > 0:
+                    logger.warning(f"账号 {username} 未找到好友: {remaining_targets}")
+                break
+
+            scrollable_element = page.locator(scrollable_friends_selector).element_handle()
+            if scrollable_element:
+                scroll_top_before = page.evaluate("(element) => element.scrollTop", scrollable_element)
+                page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
+                time.sleep(0.3)
+                scroll_top_after = page.evaluate("(element) => element.scrollTop", scrollable_element)
+
+                if scroll_top_before == scroll_top_after:
+                    empty_scroll_count += 2
+                time.sleep(1.5)
+            else:
+                break
+
+
+def do_user_task(browser, username, cookies, targets):
+    """UI 自动化方式发送消息（旧方案，保留作为 fallback）"""
+    context = browser.new_context()
+    context.set_default_navigation_timeout(config["browserTimeout"])
+    context.set_default_timeout(config["browserTimeout"])
+
+    page = context.new_page()
+    page.on("response", handle_response)
+    context.add_cookies(cookies)
+
+    retry_operation(
+        "打开抖音网页聊天页面",
+        page.goto,
+        retries=config["taskRetryTimes"],
+        delay=5,
+        url="https://www.douyin.com/chat",
+    )
+
+    time.sleep(5)
+
     for username in scroll_and_select_user(page, username, targets):
-        logger.debug(f"账号 {username} 已选中好友 {username} 发送消息")
-        # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
         chat_input_selector = CHAT_EDITOR_SELECTOR
         page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
         chat_input = page.locator(chat_input_selector)
 
-        # 在 chat-input-dccKiL 中输入内容
         message = build_message()
         for line in message.split("\\n"):
-            chat_input.type(line)  # 输入每一行
-            # 如果不是最后一行，模拟 Shift+Enter 插入换行
+            chat_input.type(line)
             if line != message.split("\\n")[-1]:
-                chat_input.press("Shift+Enter")  # 模拟 Shift+Enter 插入换行
+                chat_input.press("Shift+Enter")
 
-        logger.debug(f"账号 {username} 准备发送消息给好友 {username}：\n\t{message}")
-        logger.debug(f"账号 {username} 给好友 {username} 发送消息完成")
-        # 模拟按下回车键发送消息
         chat_input.press("Enter")
-        time.sleep(2)  # 发送完等待一会儿
+        time.sleep(2)
 
-    context.close()  # 任务完成后关闭上下文
+    context.close()
 
 
 def runTasks():
     playwright, browser = get_browser()
     try:
-        # 检查是否启用多任务和任务数量
-        # 创建信号量以限制并发任务数量
-        logger.info("开始执行任务")
-        logger.debug(f"当前配置如下：")
+        logger.info("开始执行任务（WebSocket 模式）")
         logger.debug(f"消息模板: {config.get('messageTemplate', '未找到消息模板')}")
         logger.debug(f"一言类型: {config['hitokotoTypes']}")
         for user in userData:
-            logger.debug(
-                f"用户: {user.get('username', '未知用户')}, 目标好友: {user['targets']}"
-            )
+            logger.debug(f"用户: {user.get('username', '未知用户')}, 目标好友: {user['targets']}")
 
         for user in userData:
             cookies = user["cookies"]
             targets = user["targets"]
             username = user.get("username", "未知用户")
             logger.info(f"开始处理账号 {username}")
-            # 创建任务
-            do_user_task(browser, username, cookies, targets)
+            do_user_task_ws(browser, username, cookies, targets)
             logger.info(f"账号 {username} 任务完成")
     finally:
-        # 关闭浏览器实例
         browser.close()
-
         playwright.stop()
