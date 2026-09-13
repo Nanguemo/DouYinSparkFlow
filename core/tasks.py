@@ -940,14 +940,13 @@ def search_friends_via_api(page, targets):
     return found_count
 
 
-def do_user_task_ws(browser, username, cookies, targets):
+def do_user_task(browser, username, cookies, targets):
     """
-    WebSocket 方式发送消息：
-    1. 用浏览器打开聊天页面（仅用于认证和收集信息）
-    2. 滚动列表触发 API 调用，收集好友 uid
-    3. 提取当前用户 uid 和 device_id
-    4. 关闭浏览器
-    5. 通过 WebSocket + Protobuf 发送消息
+    UI 自动化方式发送消息：
+    1. 用浏览器打开抖音（带反无头检测），激活 Cookie
+    2. 打开聊天页面，滚动列表触发 API 调用，收集好友信息（用于匹配和日志）
+    3. 通过页面原生聊天 UI 逐个点击目标会话，输入消息并发送
+       （页面自带认证的 SDK 发送，协议绝对正确，群聊也能按标题匹配）
     """
     global userIDDict, myUserInfo
     # 每个用户重置状态
@@ -1058,7 +1057,7 @@ def do_user_task_ws(browser, username, cookies, targets):
     try:
         import os
         os.makedirs("logs", exist_ok=True)
-        page.screenshot(path="logs/chat_page_debug.png", full_page=False)
+        page.screenshot(path="logs/chat_page_debug.png", full_page=False, timeout=10000)
         logger.info("已保存页面截图到 logs/chat_page_debug.png")
     except Exception as e:
         logger.debug(f"截图失败: {e}")
@@ -1073,6 +1072,14 @@ def do_user_task_ws(browser, username, cookies, targets):
             )
     except Exception:
         pass
+
+    # 等待会话列表条目出现（UI 发送的必要条件）
+    try:
+        page.wait_for_selector(CONVERSATION_ITEM_SELECTOR, timeout=30000)
+        item_count = page.locator(CONVERSATION_ITEM_SELECTOR).count()
+        logger.info(f"会话列表已加载，当前可见 {item_count} 个会话")
+    except Exception:
+        logger.warning("会话列表条目未出现，可能页面未完全加载或 Cookie 失效")
 
     # 滚动会话列表收集好友信息
     scroll_conversation_list(page, username)
@@ -1106,133 +1113,142 @@ def do_user_task_ws(browser, username, cookies, targets):
         except Exception as e:
             logger.warning(f"从 DOM 提取好友信息失败: {e}")
 
-    # 检查缺失的好友，尝试搜索（只有拥有 uid 的才算真正找到）
+    # 记录未出现在收集信息中的目标（仅提示；UI 发送阶段按会话标题匹配，群聊也可匹配）
     found_names = {info.get("remark_name") for info in userIDDict.values() if info.get("uid")}
-    missing_targets = [t for t in targets if t not in found_names]
-    if missing_targets:
-        logger.info(f"账号 {username} 有 {len(missing_targets)} 个好友未在会话列表中，尝试搜索")
-        # 先尝试 API 搜索
-        try:
-            found = search_friends_via_api(page, missing_targets)
-            if found > 0:
-                logger.info(f"通过 API 搜索找到 {found} 个好友")
-                found_names = {info.get("remark_name") for info in userIDDict.values() if info.get("uid")}
-                missing_targets = [t for t in missing_targets if t not in found_names]
-        except Exception as e:
-            logger.debug(f"API 搜索失败: {e}")
-
-        # 再尝试页面搜索框
-        if missing_targets:
-            for target in missing_targets[:5]:  # 限制搜索数量避免超时
-                search_friend_by_name(page, target)
-                time.sleep(1)
+    not_in_collected = [t for t in targets if t not in found_names]
+    if not_in_collected:
+        logger.info(
+            f"账号 {username} 有 {len(not_in_collected)} 个目标未在收集到的好友信息中: {not_in_collected}，"
+            f"发送阶段将按会话标题匹配"
+        )
 
     logger.info(f"账号 {username} 最终收集到 {len(userIDDict)} 个好友信息")
 
-    # 关闭浏览器（不再需要 UI）
-    context.close()
-    logger.info(f"账号 {username} 浏览器阶段完成，已关闭")
-
-    # ========== 阶段2: WebSocket 发送消息 ==========
-    uid = myUserInfo.get("uid")
-    device_id = myUserInfo.get("device_id")
-
-    if not uid:
-        logger.error(f"账号 {username} 未能获取当前用户 uid，无法发送消息")
-        return
-
-    # 优先使用页面自身 WebSocket 连接捕获的 device_id（服务端认可）
-    if captured_ws_url:
-        from urllib.parse import urlparse, parse_qs
+    # ========== 阶段2: 页面原生 UI 发送消息 ==========
+    # 会话列表回到顶部（收集阶段已滚动到底部）
+    for selector in CONVERSATION_LIST_SELECTORS:
         try:
-            parsed = urlparse(captured_ws_url)
-            qs = parse_qs(parsed.query)
-            ws_device_id = (qs.get("device_id") or [""])[0]
-            if ws_device_id:
-                logger.info(f"使用页面捕获的 device_id: {ws_device_id}")
-                device_id = ws_device_id
-        except Exception as e:
-            logger.debug(f"解析捕获的 WS URL 失败: {e}")
+            el = page.locator(selector).element_handle()
+            if el:
+                page.evaluate("(e) => { e.scrollTop = 0; }", el)
+                logger.debug(f"会话列表已回到顶部 ({selector})")
+                break
+        except Exception:
+            continue
+    time.sleep(2)
 
-    if not device_id:
-        logger.warning(f"账号 {username} 未能获取 device_id，使用 uid 作为 fallback（可能被服务端拒绝）")
-        device_id = uid
+    def _resolve_editor():
+        """定位可编辑的聊天输入框（容器本身或其内部 contenteditable）"""
+        loc = page.locator(CHAT_EDITOR_SELECTOR)
+        if loc.count() == 0:
+            return None
+        first = loc.first
+        try:
+            if first.evaluate("e => e.isContentEditable"):
+                return first
+        except Exception:
+            pass
+        for sel in [
+            f'{CHAT_EDITOR_SELECTOR} [contenteditable="true"]',
+            '[contenteditable="true"]',
+        ]:
+            try:
+                inner = page.locator(sel)
+                if inner.count() > 0:
+                    return inner.first
+            except Exception:
+                continue
+        return first
 
-    logger.info(f"账号 {username} 当前用户 uid={uid}, device_id={device_id}")
+    message = build_message()
+    logger.info(f"账号 {username} 消息内容: {message}")
 
-    # 导入 WebSocket 客户端
-    from core.ws_client import DouyinWSClient
-
-    # 创建 WebSocket 客户端（传入捕获的页面 WS URL 以复用其认证参数）
-    ws_client = DouyinWSClient(cookies, device_id, uid, captured_ws_url=captured_ws_url)
-
+    sent_targets = []
     try:
-        # 建立 WebSocket 连接
-        ws_client.connect(timeout=15)
-        time.sleep(2)  # 等待连接稳定
-
-        # 向每个目标好友发送消息
-        message = build_message()
-        logger.debug(f"消息内容: {message}")
-
-        for target in targets:
-            toid, friend_info = find_target_uid(target, cookies)
-
-            if not toid:
-                logger.warning(f"账号 {username} 未找到好友 {target} 的 uid，跳过")
+        for target_symbol in scroll_and_select_user(page, username, targets):
+            # 等待聊天编辑器出现
+            try:
+                page.wait_for_selector(CHAT_EDITOR_SELECTOR, timeout=30000)
+            except Exception:
+                logger.warning(f"账号 {username} 聊天编辑器未出现，跳过 {target_symbol}")
+                try:
+                    import os
+                    os.makedirs("logs", exist_ok=True)
+                    page.screenshot(path="logs/editor_missing.png", full_page=False, timeout=10000)
+                except Exception:
+                    pass
                 continue
 
-            logger.info(f"账号 {username} 开始发送消息给 {target} (uid={toid})")
+            chat_input = _resolve_editor()
+            if chat_input is None:
+                logger.warning(f"账号 {username} 未找到可编辑的输入框，跳过 {target_symbol}")
+                continue
 
-            try:
-                success = ws_client.send_message(toid, message, timeout=15)
-                if success:
-                    logger.info(f"✅ 账号 {username} 已发送消息给 {target}")
-                else:
-                    logger.warning(f"⚠️ 账号 {username} 发送消息给 {target} 可能失败")
-            except Exception as e:
-                logger.error(f"账号 {username} 发送消息给 {target} 失败: {e}")
-                traceback.print_exc()
+            # 兼容真实换行符与字面 \n 转义
+            lines = message.replace("\r\n", "\n").replace("\\n", "\n").split("\n")
+            for i, line in enumerate(lines):
+                if line:
+                    chat_input.type(line)
+                if i < len(lines) - 1:
+                    chat_input.press("Shift+Enter")
+            chat_input.press("Enter")
+            time.sleep(2)
 
-            time.sleep(2)  # 消息间隔
-
-    except ConnectionError as e:
-        logger.error(
-            f"❌ 账号 {username} WebSocket 连接失败: {e}。"
-            f"通常原因是 Cookie 过期（sessionid 失效）或 device_id 无效，请更新 GitHub Secret 中的 Cookie"
-        )
+            sent_targets.append(target_symbol)
+            logger.info(f"✅ 账号 {username} 已通过页面发送消息给 {target_symbol}")
     except Exception as e:
-        logger.error(f"❌ 账号 {username} WebSocket 发送阶段出错: {e}")
+        logger.error(f"❌ 账号 {username} UI 发送阶段出错: {e}")
         traceback.print_exc()
-    finally:
         try:
-            ws_client.close()
-            logger.info(f"账号 {username} WebSocket 连接已关闭")
+            import os
+            os.makedirs("logs", exist_ok=True)
+            page.screenshot(path="logs/send_error.png", full_page=False, timeout=10000)
         except Exception:
             pass
 
+    # 发送结果统计
+    sent_normalized = {norm(s) for s in sent_targets}
+    missing = [t for t in targets if norm(t) not in sent_normalized]
+    if missing:
+        logger.warning(f"账号 {username} 未找到 {len(missing)} 个目标的会话: {missing}")
+    logger.info(f"账号 {username} 发送完成: 成功 {len(sent_targets)}/{len(targets)}")
 
-# ========== 以下为旧的 UI 自动化代码（保留作为 fallback）==========
+    # 保存最终截图（调试用）
+    try:
+        import os
+        os.makedirs("logs", exist_ok=True)
+        page.screenshot(path="logs/chat_after_send.png", full_page=False, timeout=10000)
+    except Exception as e:
+        logger.debug(f"截图失败: {e}")
+
+    context.close()
+    logger.info(f"账号 {username} 任务完成")
+
+
+# ========== UI 会话选择辅助 ==========
 
 def checkTargetName(targetName, targets):
-    """检查targetName是否为目标"""
+    """检查会话标题是否为目标（优先名称匹配，其次 uid/short_id/unique_id）"""
     targetSymbol = None
     targetName = norm(targetName)
 
+    # 名称直接匹配（targets 也做规范化，返回原始目标便于后续统计）
+    norm_targets = {norm(t): t for t in targets}
+    if targetName in norm_targets:
+        return norm_targets[targetName]
+
+    # 通过已收集的用户信息匹配 uid/short_id/unique_id（targets 为 ID 时走这里）
     if targetName in userIDDict:
         info = userIDDict[targetName]
         for v in [info.get("uid"), info.get("short_id"), info.get("unique_id")]:
             if v and v in targets:
                 targetSymbol = v
                 break
-    else:
-        if targetName in targets:
-            targetSymbol = targetName
     return targetSymbol
 
 
 def scroll_and_select_user(page, username, targets):
-    """尝试滚动并查找用户名（UI 方式，已弃用）"""
+    """滚动会话列表，查找并点击目标会话（生成器：每命中一个目标 yield 一次）"""
     target_selector = CONVERSATION_ITEM_SELECTOR
     scrollable_friends_selector = CONVERSATION_LIST_SELECTOR
 
@@ -1291,47 +1307,10 @@ def scroll_and_select_user(page, username, targets):
                 break
 
 
-def do_user_task(browser, username, cookies, targets):
-    """UI 自动化方式发送消息（旧方案，保留作为 fallback）"""
-    context = browser.new_context()
-    context.set_default_navigation_timeout(config["browserTimeout"])
-    context.set_default_timeout(config["browserTimeout"])
-
-    page = context.new_page()
-    page.on("response", handle_response)
-    context.add_cookies(cookies)
-
-    retry_operation(
-        "打开抖音网页聊天页面",
-        page.goto,
-        retries=config["taskRetryTimes"],
-        delay=5,
-        url="https://www.douyin.com/chat",
-    )
-
-    time.sleep(5)
-
-    for username in scroll_and_select_user(page, username, targets):
-        chat_input_selector = CHAT_EDITOR_SELECTOR
-        page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
-        chat_input = page.locator(chat_input_selector)
-
-        message = build_message()
-        for line in message.split("\\n"):
-            chat_input.type(line)
-            if line != message.split("\\n")[-1]:
-                chat_input.press("Shift+Enter")
-
-        chat_input.press("Enter")
-        time.sleep(2)
-
-    context.close()
-
-
 def runTasks():
     playwright, browser = get_browser()
     try:
-        logger.info("开始执行任务（WebSocket 模式）")
+        logger.info("开始执行任务（UI 自动化模式）")
         logger.debug(f"消息模板: {config.get('messageTemplate', '未找到消息模板')}")
         logger.debug(f"一言类型: {config['hitokotoTypes']}")
         for user in userData:
@@ -1342,7 +1321,7 @@ def runTasks():
             targets = user["targets"]
             username = user.get("username", "未知用户")
             logger.info(f"开始处理账号 {username}")
-            do_user_task_ws(browser, username, cookies, targets)
+            do_user_task(browser, username, cookies, targets)
             logger.info(f"账号 {username} 任务完成")
     finally:
         browser.close()
