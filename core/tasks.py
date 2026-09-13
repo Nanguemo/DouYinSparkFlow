@@ -16,23 +16,43 @@ logger = setup_logger(level=config.get("logLevel", "Info"))
 userIDDict = {}
 # 当前用户信息: {uid, device_id}
 myUserInfo = {}
+# 捕获的 API URL 列表（用于调试）
+captured_api_urls = []
 
 CONVERSATION_ITEM_SELECTOR = ".conversationConversationItemwrapper"
 CONVERSATION_TITLE_SELECTOR = ".conversationConversationItemtitle"
 CONVERSATION_LIST_SELECTOR = ".conversationConversationListwrapper"
 CHAT_EDITOR_SELECTOR = ".messageEditorimChatEditorContainer"
 
+CONVERSATION_LIST_SELECTORS = [
+    ".conversationConversationListwrapper",
+    "[class*='conversationList']",
+    "[class*='conversation-list']",
+    "[class*='chat-list']",
+    "[class*='session-list']",
+    "[data-e2e*='chat-list']",
+    "[data-e2e*='conversation']",
+    "nav[class*='sidebar']",
+    "aside[class*='sidebar']",
+    "[class*='im-chat']",
+]
+
 
 def handle_response(response: Response):
     """
     监听接口响应，收集好友完整信息和当前用户信息
     """
-    global userIDDict, myUserInfo
+    global userIDDict, myUserInfo, captured_api_urls
 
     url = response.url
 
+    # 记录所有 awene/im 相关的 API 调用（用于调试）
+    if ("aweme" in url or "/im/" in url) and "static" not in url:
+        captured_api_urls.append(url)
+        logger.debug(f"API 响应: {url[:120]}")
+
     # 会话列表接口（主要好友信息来源）
-    if "aweme/v1/web/im/conversation/list" in url:
+    if "aweme/v1/web/im/conversation/list" in url or "conversation/list" in url:
         try:
             json_data = response.json()
             if not isinstance(json_data, dict):
@@ -64,6 +84,36 @@ def handle_response(response: Response):
                 _parse_user_info_item(item)
         except Exception as e:
             logger.warning(f"解析好友信息响应失败: {e}")
+
+    # 搜索接口（通用搜索和 IM 搜索）
+    elif "/search/" in url and "aweme" in url:
+        try:
+            json_data = response.json()
+            if not isinstance(json_data, dict):
+                return
+            # 通用搜索: data 数组中 type=1 的是用户，user_list 里是用户信息
+            data_list = json_data.get("data", []) or []
+            user_count = 0
+            for block in data_list:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == 1 or "user_list" in block:
+                    for ul in block.get("user_list", []) or []:
+                        user_info = ul.get("user_info", {}) if isinstance(ul, dict) else {}
+                        if user_info:
+                            _parse_user_info_item(user_info)
+                            user_count += 1
+            # IM 搜索: 可能直接返回用户列表
+            for key in ("user_list", "users", "friend_list"):
+                for ul in json_data.get(key, []) or []:
+                    user_info = ul.get("user_info", ul) if isinstance(ul, dict) else {}
+                    if isinstance(user_info, dict) and user_info.get("uid"):
+                        _parse_user_info_item(user_info)
+                        user_count += 1
+            if user_count:
+                logger.debug(f"搜索 API 解析到 {user_count} 个用户")
+        except Exception as e:
+            logger.debug(f"解析搜索响应失败: {e}")
 
     # 当前用户信息接口（多个可能的端点）
     elif "aweme/v1/web/query/user" in url or "aweme/v1/web/im/user/me" in url:
@@ -183,35 +233,113 @@ def scroll_conversation_list(page, username, max_scrolls=15):
     """滚动会话列表，触发 API 调用以收集好友信息"""
     logger.debug(f"账号 {username} 开始滚动会话列表收集好友信息")
 
-    scrollable_friends_selector = CONVERSATION_LIST_SELECTOR
     empty_scroll_count = 0
     MAX_EMPTY_SCROLLS = 10
 
-    # 先等待会话列表出现（短超时，避免卡死）
-    try:
-        page.wait_for_selector(scrollable_friends_selector, timeout=30000)
-    except Exception:
-        logger.warning(f"账号 {username} 未找到会话列表容器（30秒超时），可能页面未完全加载")
+    # 尝试多个选择器找到会话列表容器
+    scrollable_element = None
+    matched_selector = None
+    for selector in CONVERSATION_LIST_SELECTORS:
+        try:
+            scrollable_element = page.query_selector(selector)
+            if scrollable_element:
+                matched_selector = selector
+                logger.debug(f"找到会话列表容器: {selector}")
+                break
+        except Exception:
+            continue
+
+    if not scrollable_element:
+        # 尝试检测是否存在任何可滚动的列表容器（evaluate 返回布尔值，DOM 元素无法序列化）
+        try:
+            has_scrollable = page.evaluate("""
+                () => {
+                    const candidates = document.querySelectorAll('div[class*="list"], div[class*="container"], nav, aside');
+                    for (const el of candidates) {
+                        if (el.scrollHeight > el.clientHeight && el.clientHeight > 100) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if has_scrollable:
+                logger.debug("找到可滚动容器（通过 scrollHeight 检测）")
+                matched_selector = "auto-detected"
+                scrollable_element = True  # 哨兵值，实际滚动用 evaluate 内联查找
+        except Exception:
+            pass
+
+    if not scrollable_element:
+        logger.warning(f"账号 {username} 未找到会话列表容器，可能页面未完全加载")
+        # 尝试记录页面上所有可能的会话相关元素
+        try:
+            elem_info = page.evaluate("""
+                () => {
+                    const results = [];
+                    const selectors = ['[class*="conversation"]', '[class*="chat"]', '[class*="session"]', '[data-e2e*="chat"]', '[class*="im-"]'];
+                    for (const sel of selectors) {
+                        const els = document.querySelectorAll(sel);
+                        if (els.length > 0) {
+                            results.push({selector: sel, count: els.length, firstClass: els[0].className.substring(0, 100)});
+                        }
+                    }
+                    return results;
+                }
+            """)
+            if elem_info:
+                for info in elem_info:
+                    logger.debug(f"  找到元素: {info.get('selector')} ({info.get('count')}个) class={info.get('firstClass')}")
+        except Exception:
+            pass
         return
 
     for _ in range(max_scrolls):
         try:
-            scrollable_element = page.query_selector(scrollable_friends_selector)
-        except Exception:
-            scrollable_element = None
-        if not scrollable_element:
-            logger.warning(f"账号 {username} 未找到滚动容器")
-            break
-
-        try:
-            scroll_top_before = page.evaluate(
-                "(element) => element.scrollTop", scrollable_element
-            )
-            page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
-            time.sleep(0.3)
-            scroll_top_after = page.evaluate(
-                "(element) => element.scrollTop", scrollable_element
-            )
+            if matched_selector == "auto-detected":
+                scroll_top_before = page.evaluate("""
+                    () => {
+                        const candidates = document.querySelectorAll('div[class*="list"], div[class*="container"], nav, aside');
+                        for (const el of candidates) {
+                            if (el.scrollHeight > el.clientHeight && el.clientHeight > 100) {
+                                return el.scrollTop;
+                            }
+                        }
+                        return -1;
+                    }
+                """)
+                page.evaluate("""
+                    () => {
+                        const candidates = document.querySelectorAll('div[class*="list"], div[class*="container"], nav, aside');
+                        for (const el of candidates) {
+                            if (el.scrollHeight > el.clientHeight && el.clientHeight > 100) {
+                                el.scrollTop += 800;
+                                break;
+                            }
+                        }
+                    }
+                """)
+                time.sleep(0.3)
+                scroll_top_after = page.evaluate("""
+                    () => {
+                        const candidates = document.querySelectorAll('div[class*="list"], div[class*="container"], nav, aside');
+                        for (const el of candidates) {
+                            if (el.scrollHeight > el.clientHeight && el.clientHeight > 100) {
+                                return el.scrollTop;
+                            }
+                        }
+                        return -1;
+                    }
+                """)
+            else:
+                scroll_top_before = page.evaluate(
+                    "(element) => element.scrollTop", scrollable_element
+                )
+                page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
+                time.sleep(0.3)
+                scroll_top_after = page.evaluate(
+                    "(element) => element.scrollTop", scrollable_element
+                )
 
             if scroll_top_before == scroll_top_after:
                 empty_scroll_count += 2
@@ -234,18 +362,23 @@ def fetch_friends_via_api(page):
     global userIDDict
     logger.info("尝试通过 API 获取好友信息")
 
-    # 尝试调用会话列表 API（带分页参数）
+    # 尝试调用会话列表 API（带更多参数）
     result = page.evaluate("""
         async () => {
             const results = [];
+            const baseParams = 'device_platform=web&aid=6383&channel=channel_pc_web&pc_client_version=1.0.0&cookie_enabled=true&browser_language=zh-CN';
             const apis = [
                 {
                     url: '/aweme/v1/web/im/conversation/list/',
-                    params: 'inbox_type=0&cursor=0&limit=50',
+                    params: 'inbox_type=0&cursor=0&limit=50&' + baseParams,
                 },
                 {
                     url: '/aweme/v1/web/im/conversation/list/',
-                    params: 'inbox_type=1&cursor=0&limit=50',
+                    params: 'inbox_type=1&cursor=0&limit=50&' + baseParams,
+                },
+                {
+                    url: '/aweme/v1/web/im/conversation/list/',
+                    params: 'inbox_type=0&cursor=0&limit=100&' + baseParams,
                 },
             ];
             for (const api of apis) {
@@ -255,10 +388,23 @@ def fetch_friends_via_api(page):
                         headers: {'Accept': 'application/json'}
                     });
                     if (resp.ok) {
-                        const data = await resp.json();
-                        results.push({url: api.url, params: api.params, data: data});
+                        const text = await resp.text();
+                        if (text && text.trim()) {
+                            try {
+                                const data = JSON.parse(text);
+                                results.push({url: api.url, params: api.params, data: data});
+                            } catch (e) {
+                                results.push({url: api.url, error: 'JSON parse failed', body: text.substring(0, 200)});
+                            }
+                        } else {
+                            results.push({url: api.url, error: 'Empty response', status: resp.status});
+                        }
+                    } else {
+                        results.push({url: api.url, error: 'HTTP ' + resp.status, status: resp.status});
                     }
-                } catch (e) {}
+                } catch (e) {
+                    results.push({url: api.url, error: e.message});
+                }
             }
             return results.length > 0 ? results : null;
         }
@@ -270,6 +416,14 @@ def fetch_friends_via_api(page):
 
     for api_result in result:
         api_url = api_result.get("url", "")
+
+        # 处理错误响应
+        if "error" in api_result:
+            logger.warning(f"API {api_url} 错误: {api_result.get('error')}")
+            if "body" in api_result:
+                logger.debug(f"  响应体: {api_result.get('body', '')[:200]}")
+            continue
+
         data = api_result.get("data", {})
 
         # 记录响应结构帮助调试
@@ -332,6 +486,98 @@ def fetch_friends_via_api(page):
                 }
 
     logger.info(f"通过 API 收集到 {len(userIDDict)} 个好友信息")
+
+
+def extract_friends_from_dom(page):
+    """从页面 DOM 和 JS 状态提取好友信息（最后 fallback）"""
+    global userIDDict
+    found = 0
+
+    # 方法1: 从 __INITIAL_STATE__ 提取会话数据
+    try:
+        result = page.evaluate("""
+            () => {
+                const conversations = [];
+                if (window.__INITIAL_STATE__) {
+                    const findConv = (obj, path = '', depth = 0) => {
+                        if (depth > 6 || !obj || typeof obj !== 'object') return;
+                        for (const key of Object.keys(obj)) {
+                            const val = obj[key];
+                            if (Array.isArray(val) && val.length > 0 && val.length < 200) {
+                                if (key.match(/conversation|chat|session|friend/i)) {
+                                    conversations.push({key: key, path: path + '.' + key, sample: JSON.stringify(val[0]).substring(0, 500)});
+                                }
+                            }
+                            findConv(val, path + '.' + key, depth + 1);
+                        }
+                    };
+                    findConv(window.__INITIAL_STATE__);
+                }
+                return conversations;
+            }
+        """)
+        if result:
+            logger.debug(f"从 __INITIAL_STATE__ 找到 {len(result)} 个可能的会话数组")
+            for conv in result:
+                logger.debug(f"  key={conv.get('key')}, path={conv.get('path')}")
+                logger.debug(f"  sample={conv.get('sample', '')[:200]}")
+    except Exception as e:
+        logger.debug(f"从 __INITIAL_STATE__ 提取失败: {e}")
+
+    # 方法2: 从 DOM 元素提取好友名称
+    try:
+        items = page.evaluate("""
+            () => {
+                const results = [];
+                const selectors = [
+                    '[class*="conversation"] [class*="title"]',
+                    '[class*="conversation"] [class*="name"]',
+                    '[class*="chat-item"] [class*="name"]',
+                    '[class*="session"] [class*="title"]',
+                    '[data-e2e*="chat"] [class*="name"]',
+                    '[class*="im-chat"] [class*="name"]',
+                    '[class*="conv"] [class*="name"]',
+                ];
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        const text = (el.innerText || '').trim();
+                        if (text && text.length < 50) {
+                            const parent = el.closest('[class*="conversation"], [class*="chat"], [class*="session"], [data-e2e*="chat"]');
+                            const dataUid = parent ? (parent.getAttribute('data-uid') || parent.getAttribute('data-id') || '') : '';
+                            results.push({name: text, uid: dataUid, selector: sel});
+                        }
+                    }
+                }
+                return results;
+            }
+        """)
+        if items:
+            logger.debug(f"从 DOM 提取到 {len(items)} 个可能的好友名称")
+            for item in items:
+                name = norm(item.get("name", ""))
+                uid = item.get("uid", "")
+                if name and name not in userIDDict:
+                    if uid:
+                        userIDDict[name] = {
+                            "uid": uid, "short_id": "", "unique_id": "",
+                            "sec_uid": "", "nickname": name, "remark_name": name,
+                        }
+                        found += 1
+                    else:
+                        # 即使没有 uid，也记录名称（后续可能通过搜索找到 uid）
+                        userIDDict[name] = {
+                            "uid": "", "short_id": "", "unique_id": "",
+                            "sec_uid": "", "nickname": name, "remark_name": name,
+                        }
+                        found += 1
+                        logger.debug(f"  DOM 好友(无uid): {name}")
+    except Exception as e:
+        logger.debug(f"从 DOM 提取好友信息失败: {e}")
+
+    if found > 0:
+        logger.info(f"从 DOM/JS 状态提取到 {found} 个好友信息")
+    return found
 
 
 def extract_user_info_from_page(page):
@@ -480,57 +726,92 @@ def find_target_uid(target, cookies):
 
 
 def search_friend_by_name(page, target_name):
-    """通过抖音聊天页面搜索功能查找好友 uid"""
+    """通过抖音搜索查找好友 uid：先试聊天页搜索框，失败则用主站搜索页"""
     global userIDDict
     logger.info(f"尝试搜索好友: {target_name}")
 
+    # ---- 方式1: 聊天页面搜索框 ----
     try:
-        # 尝试找到搜索输入框
         search_selectors = [
             'input[placeholder*="搜索"]',
             'input[placeholder*="search"]',
-            'input[data-testid*="search"]',
-            '.search-input input',
-            'input[type="text"]',
+            'input[placeholder*="查找"]',
+            '[class*="search"] input',
         ]
 
         search_input = None
         for selector in search_selectors:
             try:
-                search_input = page.wait_for_selector(selector, timeout=5000)
+                search_input = page.query_selector(selector)
                 if search_input:
                     logger.debug(f"找到搜索输入框: {selector}")
                     break
-            except:
+            except Exception:
                 continue
 
-        if not search_input:
-            logger.warning(f"未找到搜索输入框")
-            return None
+        if search_input:
+            search_input.click()
+            search_input.fill("")
+            search_input.type(target_name)
+            time.sleep(3)
+            time.sleep(2)  # 等待搜索 API 响应被 handle_response 捕获
 
-        # 清空并输入搜索内容
-        search_input.click()
-        search_input.fill("")
-        search_input.type(target_name)
-        time.sleep(3)  # 等待搜索结果
+            for remark_name, info in userIDDict.items():
+                if target_name in [info["remark_name"], info["nickname"]]:
+                    uid = info.get("uid", "")
+                    if uid:
+                        logger.info(f"聊天页搜索找到好友 {target_name} (uid={uid})")
+                        return uid, info
 
-        # 捕获搜索 API 响应（通过 handle_response 自动处理）
-        time.sleep(2)
+            # 清空搜索框
+            try:
+                search_input.fill("")
+                time.sleep(1)
+            except Exception:
+                pass
+        else:
+            logger.debug("聊天页未找到搜索输入框")
+    except Exception as e:
+        logger.debug(f"聊天页搜索 {target_name} 失败: {e}")
 
-        # 检查是否在 userIDDict 中找到了目标
+    # ---- 方式2: 抖音主站搜索页（页面自带 X-Bogus 签名）----
+    try:
+        from urllib.parse import quote
+        search_url = f"https://www.douyin.com/search/{quote(target_name)}?type=user"
+        before_count = len([v for v in userIDDict.values() if v.get("uid")])
+
+        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        time.sleep(5)  # 等待搜索结果渲染和 API 响应
+
+        # handle_response 会解析搜索 API 响应并填充 userIDDict
+        # 检查新增的条目中是否有精确匹配目标的
+        matched = None
         for remark_name, info in userIDDict.items():
             if target_name in [info["remark_name"], info["nickname"]]:
                 uid = info.get("uid", "")
                 if uid:
-                    logger.info(f"搜索找到好友 {target_name} (uid={uid})")
-                    return uid, info
+                    matched = (uid, info)
+                    break
 
-        # 清空搜索框
-        search_input.fill("")
-        time.sleep(1)
+        if matched:
+            logger.info(f"主站搜索找到好友 {target_name} (uid={matched[0]})")
+            return matched
 
+        new_count = len([v for v in userIDDict.values() if v.get("uid")])
+        logger.debug(f"主站搜索后新增 {new_count - before_count} 个用户，但无精确匹配 {target_name}")
+
+        # 回到聊天页，保持后续流程的页面状态
+        try:
+            page.goto("https://www.douyin.com/chat", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)
+        except Exception:
+            pass
     except Exception as e:
-        logger.warning(f"搜索好友 {target_name} 失败: {e}")
+        logger.debug(f"主站搜索 {target_name} 失败: {e}")
 
     return None, None
 
@@ -611,15 +892,46 @@ def do_user_task_ws(browser, username, cookies, targets):
     myUserInfo = {}
 
     # ========== 阶段1: 浏览器提取认证信息 ==========
-    context = browser.new_context()
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1920, "height": 1080},
+        locale="zh-CN",
+        timezone_id="Asia/Shanghai",
+    )
     context.set_default_navigation_timeout(config["browserTimeout"])
     context.set_default_timeout(config["browserTimeout"])
+
+    # 反无头检测：移除 navigator.webdriver 标记
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        window.chrome = window.chrome || {runtime: {}};
+        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+    """)
 
     page = context.new_page()
     page.on("response", handle_response)
 
     # 注入 Cookie
     context.add_cookies(cookies)
+
+    # 先打开抖音主页（激活 Cookie 并触发风控初始化），再进聊天页
+    retry_operation(
+        "打开抖音主页",
+        page.goto,
+        retries=config["taskRetryTimes"],
+        delay=5,
+        url="https://www.douyin.com/",
+        wait_until="domcontentloaded",
+    )
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    time.sleep(5)
 
     # 打开聊天页面（用 domcontentloaded 避免 SPA load 超时）
     retry_operation(
@@ -639,8 +951,57 @@ def do_user_task_ws(browser, username, cookies, targets):
         logger.warning("等待 networkidle 超时，继续执行")
     time.sleep(15)  # 给 JS 足够时间渲染会话列表
 
+    # ========== 页面调试信息 ==========
+    global captured_api_urls
+    captured_api_urls = []
+    try:
+        logger.info(f"页面 URL: {page.url}")
+        logger.info(f"页面标题: {page.title()}")
+    except Exception:
+        pass
+    # 检测登录状态（URL 跳转到 passport 说明 Cookie 失效）
+    try:
+        current_url = page.url
+        if "passport" in current_url or "login" in current_url:
+            logger.error(f"页面跳转到登录页: {current_url}，Cookie 可能已失效！")
+        login_state = page.evaluate("""
+            () => {
+                const state = window.__INITIAL_STATE__ || {};
+                const user = state.user || {};
+                return {
+                    hasInitialState: !!window.__INITIAL_STATE__,
+                    isLoggedIn: !!(user.uid || user.userId || user.id),
+                    uid: String(user.uid || user.userId || user.id || ''),
+                };
+            }
+        """)
+        logger.info(f"页面登录状态: {login_state}")
+    except Exception as e:
+        logger.debug(f"检测登录状态失败: {e}")
+    try:
+        import os
+        os.makedirs("logs", exist_ok=True)
+        page.screenshot(path="logs/chat_page_debug.png", full_page=False)
+        logger.info("已保存页面截图到 logs/chat_page_debug.png")
+    except Exception as e:
+        logger.debug(f"截图失败: {e}")
+    try:
+        body_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
+        logger.debug(f"页面文本预览: {body_text[:200]}")
+    except Exception:
+        pass
+
     # 滚动会话列表收集好友信息
     scroll_conversation_list(page, username)
+
+    # 记录捕获到的 API 调用
+    if captured_api_urls:
+        logger.info(f"页面共调用了 {len(captured_api_urls)} 个 API")
+        for api_url in captured_api_urls[:20]:
+            logger.debug(f"  API: {api_url[:150]}")
+    else:
+        logger.warning("页面未调用任何 aweme/im API，可能页面未完全加载或 Cookie 已过期")
+    captured_api_urls = []
     logger.info(f"账号 {username} 共收集到 {len(userIDDict)} 个好友信息")
 
     # 提取当前用户信息
@@ -654,8 +1015,16 @@ def do_user_task_ws(browser, username, cookies, targets):
         except Exception as e:
             logger.warning(f"通过 API 获取好友信息失败: {e}")
 
-    # 检查缺失的好友，尝试搜索
-    found_names = {info.get("remark_name") for info in userIDDict.values()}
+    # 如果 API 也失败，尝试从 DOM/JS 状态提取
+    if not userIDDict:
+        logger.warning(f"账号 {username} API 获取也失败，尝试从 DOM/JS 状态提取")
+        try:
+            extract_friends_from_dom(page)
+        except Exception as e:
+            logger.warning(f"从 DOM 提取好友信息失败: {e}")
+
+    # 检查缺失的好友，尝试搜索（只有拥有 uid 的才算真正找到）
+    found_names = {info.get("remark_name") for info in userIDDict.values() if info.get("uid")}
     missing_targets = [t for t in targets if t not in found_names]
     if missing_targets:
         logger.info(f"账号 {username} 有 {len(missing_targets)} 个好友未在会话列表中，尝试搜索")
@@ -664,8 +1033,8 @@ def do_user_task_ws(browser, username, cookies, targets):
             found = search_friends_via_api(page, missing_targets)
             if found > 0:
                 logger.info(f"通过 API 搜索找到 {found} 个好友")
-                missing_targets = [t for t in missing_targets
-                                   if t not in {info.get("remark_name") for info in userIDDict.values()}]
+                found_names = {info.get("remark_name") for info in userIDDict.values() if info.get("uid")}
+                missing_targets = [t for t in missing_targets if t not in found_names]
         except Exception as e:
             logger.debug(f"API 搜索失败: {e}")
 

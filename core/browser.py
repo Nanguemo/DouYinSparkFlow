@@ -38,9 +38,19 @@ def get_browser():
         )
 
     try:
-        # 启动浏览器
-        playwright = sync_playwright().start() 
-        browser = playwright.chromium.launch(headless=headless)
+        # 启动浏览器（带反无头检测参数）
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+                "--start-maximized",
+            ],
+        )
         return playwright, browser
     except Exception as e:
         # 捕获浏览器启动错误
