@@ -279,7 +279,7 @@ def get_cookie_value(cookies: list, name: str) -> str:
 class DouyinWSClient:
     """抖音 WebSocket 消息客户端"""
 
-    def __init__(self, cookies: list, device_id: str, myid: str):
+    def __init__(self, cookies: list, device_id: str, myid: str, captured_ws_url: str = None):
         self.cookies = cookies
         self.cookie_str = cookies_to_string(cookies)
         self.device_id = device_id
@@ -288,6 +288,27 @@ class DouyinWSClient:
         self.sessionid = get_cookie_value(cookies, "sessionid") or get_cookie_value(cookies, "sessionid_ss")
         if not self.sessionid:
             logger.warning("Cookie 中缺少 sessionid/sessionid_ss，WebSocket 认证 token 为空，消息大概率无法发送")
+
+        # 如果浏览器阶段捕获了页面自身的 WS URL，直接复用其认证参数
+        self.captured_ws_url = captured_ws_url
+        if captured_ws_url:
+            try:
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(captured_ws_url)
+                qs = parse_qs(parsed.query)
+                cap_device_id = (qs.get("device_id") or [""])[0]
+                cap_token = (qs.get("token") or [""])[0]
+                cap_access_key = (qs.get("access_key") or [""])[0]
+                if cap_device_id:
+                    self.device_id = cap_device_id
+                if cap_token:
+                    self.sessionid = cap_token
+                if cap_access_key:
+                    self.access_key = cap_access_key
+                logger.info(f"复用页面 WS 认证参数: device_id={self.device_id}, token={self.sessionid[:8]}***")
+            except Exception as e:
+                logger.warning(f"解析捕获的 WS URL 失败，使用默认参数: {e}")
+
         self.ws = None
         self._connected = False
         self._response_received = False

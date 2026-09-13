@@ -18,6 +18,8 @@ userIDDict = {}
 myUserInfo = {}
 # 捕获的 API URL 列表（用于调试）
 captured_api_urls = []
+# 捕获的页面自身 WebSocket 连接 URL（包含正确的 device_id/token/access_key）
+captured_ws_url = None
 
 CONVERSATION_ITEM_SELECTOR = ".conversationConversationItemwrapper"
 CONVERSATION_TITLE_SELECTOR = ".conversationConversationItemtitle"
@@ -36,6 +38,21 @@ CONVERSATION_LIST_SELECTORS = [
     "aside[class*='sidebar']",
     "[class*='im-chat']",
 ]
+
+
+def handle_websocket(ws):
+    """
+    监听页面自身的 WebSocket 连接，捕获 IM 连接 URL
+    （其中包含服务端认可的 device_id / token / access_key）
+    """
+    global captured_ws_url
+    try:
+        url = ws.url
+        if ("frontier" in url or "im" in url.lower()) and url.startswith("wss://"):
+            captured_ws_url = url
+            logger.info(f"捕获到页面 IM WebSocket 连接: {url[:180]}")
+    except Exception as e:
+        logger.debug(f"捕获 WebSocket 连接失败: {e}")
 
 
 def handle_response(response: Response):
@@ -936,6 +953,8 @@ def do_user_task_ws(browser, username, cookies, targets):
     # 每个用户重置状态
     userIDDict = {}
     myUserInfo = {}
+    global captured_ws_url
+    captured_ws_url = None
 
     # ========== 阶段1: 浏览器提取认证信息 ==========
     context = browser.new_context(
@@ -960,6 +979,7 @@ def do_user_task_ws(browser, username, cookies, targets):
 
     page = context.new_page()
     page.on("response", handle_response)
+    page.on("websocket", handle_websocket)
 
     # 注入 Cookie
     context.add_cookies(cookies)
@@ -1121,17 +1141,30 @@ def do_user_task_ws(browser, username, cookies, targets):
         logger.error(f"账号 {username} 未能获取当前用户 uid，无法发送消息")
         return
 
+    # 优先使用页面自身 WebSocket 连接捕获的 device_id（服务端认可）
+    if captured_ws_url:
+        from urllib.parse import urlparse, parse_qs
+        try:
+            parsed = urlparse(captured_ws_url)
+            qs = parse_qs(parsed.query)
+            ws_device_id = (qs.get("device_id") or [""])[0]
+            if ws_device_id:
+                logger.info(f"使用页面捕获的 device_id: {ws_device_id}")
+                device_id = ws_device_id
+        except Exception as e:
+            logger.debug(f"解析捕获的 WS URL 失败: {e}")
+
     if not device_id:
-        logger.error(f"账号 {username} 未能获取 device_id，无法建立 WebSocket 连接")
-        return
+        logger.warning(f"账号 {username} 未能获取 device_id，使用 uid 作为 fallback（可能被服务端拒绝）")
+        device_id = uid
 
     logger.info(f"账号 {username} 当前用户 uid={uid}, device_id={device_id}")
 
     # 导入 WebSocket 客户端
     from core.ws_client import DouyinWSClient
 
-    # 创建 WebSocket 客户端
-    ws_client = DouyinWSClient(cookies, device_id, uid)
+    # 创建 WebSocket 客户端（传入捕获的页面 WS URL 以复用其认证参数）
+    ws_client = DouyinWSClient(cookies, device_id, uid, captured_ws_url=captured_ws_url)
 
     try:
         # 建立 WebSocket 连接
@@ -1163,9 +1196,20 @@ def do_user_task_ws(browser, username, cookies, targets):
 
             time.sleep(2)  # 消息间隔
 
+    except ConnectionError as e:
+        logger.error(
+            f"❌ 账号 {username} WebSocket 连接失败: {e}。"
+            f"通常原因是 Cookie 过期（sessionid 失效）或 device_id 无效，请更新 GitHub Secret 中的 Cookie"
+        )
+    except Exception as e:
+        logger.error(f"❌ 账号 {username} WebSocket 发送阶段出错: {e}")
+        traceback.print_exc()
     finally:
-        ws_client.close()
-        logger.info(f"账号 {username} WebSocket 连接已关闭")
+        try:
+            ws_client.close()
+            logger.info(f"账号 {username} WebSocket 连接已关闭")
+        except Exception:
+            pass
 
 
 # ========== 以下为旧的 UI 自动化代码（保留作为 fallback）==========
