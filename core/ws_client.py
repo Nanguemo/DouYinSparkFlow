@@ -286,6 +286,8 @@ class DouyinWSClient:
         self.myid = myid
         self.access_key = calculate_access_key(device_id)
         self.sessionid = get_cookie_value(cookies, "sessionid") or get_cookie_value(cookies, "sessionid_ss")
+        if not self.sessionid:
+            logger.warning("Cookie 中缺少 sessionid/sessionid_ss，WebSocket 认证 token 为空，消息大概率无法发送")
         self.ws = None
         self._connected = False
         self._response_received = False

@@ -122,16 +122,18 @@ def handle_response(response: Response):
             if not isinstance(json_data, dict):
                 return
             logger.debug(f"用户信息 API 响应 keys: {list(json_data.keys())}")
-            # id 字段是用户 UID（抖音 API 的 id 即用户账号 UID）
+            status_code = json_data.get("status_code", None)
+            # user_uid 是用户 UID；id 可能是设备 ID（未登录时也会返回）
             uid = (
                 json_data.get("uid", "") or
+                json_data.get("user_uid", "") or
                 json_data.get("user", {}).get("uid", "") or
-                json_data.get("id", "") or
-                json_data.get("user", {}).get("id", "")
+                json_data.get("user", {}).get("id", "") or
+                json_data.get("id", "")
             )
             if uid:
                 myUserInfo["uid"] = str(uid)
-                logger.debug(f"捕获到当前用户 uid: {uid}")
+                logger.debug(f"捕获到当前用户 uid: {uid} (status_code={status_code})")
             # device_id 从专门字段获取
             device_id = (
                 json_data.get("device_id", "") or
@@ -788,6 +790,50 @@ def search_friend_by_name(page, target_name):
         time.sleep(5)  # 等待搜索结果渲染和 API 响应
 
         # handle_response 会解析搜索 API 响应并填充 userIDDict
+        # 搜索页是 SSR 渲染，结果直接嵌在 __INITIAL_STATE__ 中，也提取一份
+        try:
+            ssr_users = page.evaluate("""
+                () => {
+                    const state = window.__INITIAL_STATE__;
+                    if (!state) return null;
+                    const users = [];
+                    const seen = new Set();
+                    // 深度遍历 state，收集所有带 uid+nickname 的用户对象
+                    const scan = (obj, depth) => {
+                        if (depth > 8 || !obj || typeof obj !== 'object') return;
+                        if (Array.isArray(obj)) {
+                            for (const item of obj) scan(item, depth + 1);
+                            return;
+                        }
+                        const uid = obj.uid || obj.user_id || '';
+                        const nickname = obj.nickname || '';
+                        if (uid && nickname && !seen.has(String(uid))) {
+                            seen.add(String(uid));
+                            users.push({
+                                uid: String(uid),
+                                nickname: nickname,
+                                sec_uid: obj.sec_uid || '',
+                                short_id: obj.short_id || '',
+                                unique_id: obj.unique_id || '',
+                                remark_name: obj.remark_name || nickname,
+                            });
+                        }
+                        for (const key of Object.keys(obj)) {
+                            scan(obj[key], depth + 1);
+                        }
+                    };
+                    scan(state, 0);
+                    return users.slice(0, 50);
+                }
+            """)
+            if ssr_users:
+                logger.debug(f"从搜索页 __INITIAL_STATE__ 提取到 {len(ssr_users)} 个用户")
+                for u in ssr_users:
+                    if isinstance(u, dict) and u.get("uid"):
+                        _parse_user_info_item(u)
+        except Exception as e:
+            logger.debug(f"从搜索页 __INITIAL_STATE__ 提取失败: {e}")
+
         # 检查新增的条目中是否有精确匹配目标的
         matched = None
         for remark_name, info in userIDDict.items():
@@ -918,6 +964,17 @@ def do_user_task_ws(browser, username, cookies, targets):
     # 注入 Cookie
     context.add_cookies(cookies)
 
+    # Cookie 诊断：检查关键登录 Cookie 是否存在
+    cookie_names = sorted(c.get("name", "") for c in cookies)
+    logger.info(f"已加载 {len(cookies)} 个 Cookie: {', '.join(cookie_names)}")
+    critical_cookies = ["sessionid", "sessionid_ss"]
+    missing_critical = [c for c in critical_cookies if c not in cookie_names]
+    if missing_critical:
+        logger.error(
+            f"❌ 缺少关键登录 Cookie: {missing_critical}！"
+            f"聊天功能需要 sessionid，请在已登录抖音的浏览器中重新导出完整 Cookie 并更新 GitHub Secret"
+        )
+
     # 先打开抖音主页（激活 Cookie 并触发风控初始化），再进聊天页
     retry_operation(
         "打开抖音主页",
@@ -988,6 +1045,12 @@ def do_user_task_ws(browser, username, cookies, targets):
     try:
         body_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
         logger.debug(f"页面文本预览: {body_text[:200]}")
+        # 检测登录弹窗
+        if "扫码登录" in body_text or "验证码登录" in body_text:
+            logger.error(
+                "❌ 聊天页面显示登录弹窗，Cookie 已失效或不完整！"
+                "请重新导出完整 Cookie（必须包含 sessionid）并更新 GitHub Secret"
+            )
     except Exception:
         pass
 
