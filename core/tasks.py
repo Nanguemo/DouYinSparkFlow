@@ -998,7 +998,7 @@ def do_user_task(browser, username, cookies, targets):
         page.goto,
         retries=config["taskRetryTimes"],
         delay=5,
-        url="https://www.douyin.com/",
+        url="https://creator.douyin.com/",
         wait_until="domcontentloaded",
     )
     try:
@@ -1013,7 +1013,7 @@ def do_user_task(browser, username, cookies, targets):
         page.goto,
         retries=config["taskRetryTimes"],
         delay=5,
-        url="https://www.douyin.com/chat",
+        url="https://creator.douyin.com/creator-micro/data/following/chat",
         wait_until="domcontentloaded",
     )
     logger.info(f"账号 {username} 聊天页面已打开，等待加载...")
