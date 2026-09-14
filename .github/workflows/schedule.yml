@@ -19,6 +19,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      secrets: write
     steps:
       - uses: actions/checkout@v4
       - name: Check if already succeeded today
@@ -64,6 +65,56 @@ jobs:
         with:
           name: run-logs
           path: logs/
+
+      - name: Auto-refresh Cookie Secret
+        if: ${{ success() && steps.check.outputs.count == '0' }}
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          if [ -f logs/refreshed_cookies.json ]; then
+            echo "Found refreshed cookies, updating GitHub Secret..."
+            python - << 'PYEOF'
+          import base64, json, os, sys, requests
+          from nacl import encoding, public
+
+          token = os.environ.get("PAT_TOKEN", "")
+          if not token:
+              print("PAT_TOKEN not set, skipping cookie refresh")
+              sys.exit(0)
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          secret_name = "COOKIES_ZKX051118"
+
+          with open("logs/refreshed_cookies.json", "r", encoding="utf-8") as f:
+              cookies = json.load(f)
+          secret_value = json.dumps(cookies, ensure_ascii=False)
+
+          headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+          r = requests.get(f"https://api.github.com/repos/{repo}/actions/secrets/public-key", headers=headers, timeout=30)
+          if r.status_code != 200:
+              print(f"Failed to get public key: {r.status_code}")
+              sys.exit(1)
+          pk = r.json()
+
+          pk_obj = public.PublicKey(pk["key"].encode("utf-8"), encoding.Base64Encoder())
+          encrypted = public.SealedBox(pk_obj).encrypt(secret_value.encode("utf-8"))
+          enc_b64 = base64.b64encode(encrypted).decode("utf-8")
+
+          r = requests.put(
+              f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}",
+              headers=headers,
+              json={"encrypted_value": enc_b64, "key_id": pk["key_id"]},
+              timeout=30,
+          )
+          if r.status_code in (201, 204):
+              print(f"SUCCESS: Secret {secret_name} updated with {len(cookies)} cookies")
+          else:
+              print(f"FAILED: HTTP {r.status_code}")
+              sys.exit(1)
+          PYEOF
+          else
+            echo "No refreshed cookies found, skipping update"
+          fi
 
   workflow-keepalive:
     if: github.event_name == 'schedule'

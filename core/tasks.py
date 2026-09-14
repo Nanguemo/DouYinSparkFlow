@@ -943,19 +943,19 @@ def search_friends_via_api(page, targets):
 def do_user_task(browser, username, cookies, targets):
     """
     UI 自动化方式发送消息：
-    1. 用浏览器打开抖音（带反无头检测），激活 Cookie
-    2. 打开聊天页面，滚动列表触发 API 调用，收集好友信息（用于匹配和日志）
-    3. 通过页面原生聊天 UI 逐个点击目标会话，输入消息并发送
-       （页面自带认证的 SDK 发送，协议绝对正确，群聊也能按标题匹配）
+    1. 用浏览器打开抖音创作者中心（带反无头检测），激活 Cookie
+    2. 导航到消息页面，滚动列表查找目标好友
+    3. 点击会话，用 keyboard 级别输入消息并发送
+    4. 发送后验证消息是否出现在聊天区域
+    5. 提取刷新后的 Cookie 保存到文件（供自动续期）
     """
     global userIDDict, myUserInfo
-    # 每个用户重置状态
     userIDDict = {}
     myUserInfo = {}
     global captured_ws_url
     captured_ws_url = None
 
-    # ========== 阶段1: 浏览器提取认证信息 ==========
+    # ========== 阶段1: 浏览器设置 ==========
     context = browser.new_context(
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -968,7 +968,6 @@ def do_user_task(browser, username, cookies, targets):
     context.set_default_navigation_timeout(config["browserTimeout"])
     context.set_default_timeout(config["browserTimeout"])
 
-    # 反无头检测：移除 navigator.webdriver 标记
     context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         window.chrome = window.chrome || {runtime: {}};
@@ -983,7 +982,6 @@ def do_user_task(browser, username, cookies, targets):
     # 注入 Cookie
     context.add_cookies(cookies)
 
-    # Cookie 诊断：检查关键登录 Cookie 是否存在
     cookie_names = sorted(c.get("name", "") for c in cookies)
     logger.info(f"已加载 {len(cookies)} 个 Cookie: {', '.join(cookie_names)}")
     critical_cookies = ["sessionid", "sessionid_ss"]
@@ -991,10 +989,10 @@ def do_user_task(browser, username, cookies, targets):
     if missing_critical:
         logger.error(
             f"❌ 缺少关键登录 Cookie: {missing_critical}！"
-            f"聊天功能需要 sessionid，请在已登录抖音的浏览器中重新导出完整 Cookie 并更新 GitHub Secret"
+            f"请重新导出完整 Cookie 并更新 GitHub Secret"
         )
 
-    # 先打开抖音主页（激活 Cookie 并触发风控初始化），再进聊天页
+    # ========== 阶段2: 打开抖音主页（激活 Cookie）==========
     retry_operation(
         "打开抖音主页",
         page.goto,
@@ -1007,27 +1005,25 @@ def do_user_task(browser, username, cookies, targets):
         page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
-    time.sleep(5)
+    time.sleep(3)
 
-    # 打开聊天页面（用 domcontentloaded 避免 SPA load 超时）
+    # ========== 阶段3: 导航到聊天页面 ==========
     retry_operation(
-        "打开抖音网页聊天页面",
+        "打开抖音聊天页面",
         page.goto,
         retries=config["taskRetryTimes"],
         delay=5,
         url="https://www.douyin.com/chat",
         wait_until="domcontentloaded",
     )
-
     logger.info(f"账号 {username} 聊天页面已打开，等待加载...")
-    # 等待网络空闲和 JS 渲染
     try:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         logger.warning("等待 networkidle 超时，继续执行")
-    time.sleep(15)  # 给 JS 足够时间渲染会话列表
+    time.sleep(10)
 
-    # ========== 页面调试信息 ==========
+    # ========== 登录状态检测 ==========
     global captured_api_urls
     captured_api_urls = []
     try:
@@ -1035,55 +1031,54 @@ def do_user_task(browser, username, cookies, targets):
         logger.info(f"页面标题: {page.title()}")
     except Exception:
         pass
-    # 检测登录状态（URL 跳转到 passport 说明 Cookie 失效）
-    login_state = {"isLoggedIn": False}
+
+    # 检测登录弹窗/跳转
+    is_logged_in = True
     try:
         current_url = page.url
-        if "passport" in current_url or "login" in current_url:
-            logger.error(f"页面跳转到登录页: {current_url}，Cookie 可能已失效！")
-        login_state = page.evaluate("""
-            () => {
-                const state = window.__INITIAL_STATE__ || {};
-                const user = state.user || {};
-                return {
-                    hasInitialState: !!window.__INITIAL_STATE__,
-                    isLoggedIn: !!(user.uid || user.userId || user.id),
-                    uid: String(user.uid || user.userId || user.id || ''),
-                };
-            }
-        """)
-        logger.info(f"页面登录状态: {login_state}")
+        body_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
+        logger.debug(f"页面文本预览: {body_text[:200]}")
+        if "passport" in current_url or "login" in current_url.lower():
+            logger.error(f"页面跳转到登录页: {current_url}，Cookie 已失效！")
+            is_logged_in = False
+        if "扫码登录" in body_text or "验证码登录" in body_text:
+            logger.error("❌ 页面显示登录弹窗，Cookie 已失效！")
+            is_logged_in = False
     except Exception as e:
         logger.debug(f"检测登录状态失败: {e}")
+
+    if not is_logged_in:
+        logger.error(f"❌ 账号 {username} Cookie 已失效，跳过发送，请更新 GitHub Secret 中的 Cookie")
+        try:
+            import os
+            os.makedirs("logs", exist_ok=True)
+            page.screenshot(path="logs/cookie_expired.png", full_page=False, timeout=10000)
+        except Exception:
+            pass
+        context.close()
+        return
+
+    # ========== Cookie 自动续期：提取刷新后的 Cookie ==========
+    try:
+        refreshed_cookies = context.cookies()
+        if refreshed_cookies and len(refreshed_cookies) >= len(cookies):
+            import os
+            os.makedirs("logs", exist_ok=True)
+            with open("logs/refreshed_cookies.json", "w", encoding="utf-8") as f:
+                json.dump(refreshed_cookies, f, ensure_ascii=False)
+            logger.info(f"已保存 {len(refreshed_cookies)} 个刷新后的 Cookie 到 logs/refreshed_cookies.json")
+    except Exception as e:
+        logger.warning(f"提取刷新后的 Cookie 失败: {e}")
+
+    # ========== 截图调试 ==========
     try:
         import os
         os.makedirs("logs", exist_ok=True)
         page.screenshot(path="logs/chat_page_debug.png", full_page=False, timeout=10000)
-        logger.info("已保存页面截图到 logs/chat_page_debug.png")
-    except Exception as e:
-        logger.debug(f"截图失败: {e}")
-    try:
-        body_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
-        logger.debug(f"页面文本预览: {body_text[:200]}")
-        # 检测登录弹窗
-        if "扫码登录" in body_text or "验证码登录" in body_text:
-            logger.error(
-                "❌ 聊天页面显示登录弹窗，Cookie 已失效或不完整！"
-                "请重新导出完整 Cookie（必须包含 sessionid）并更新 GitHub Secret"
-            )
     except Exception:
         pass
 
-    # 检测到未登录时提前退出，避免后续步骤空转浪费时间
-    if not login_state.get("isLoggedIn"):
-        logger.error(
-            f"❌ 账号 {username} 未登录（isLoggedIn=False），Cookie 已失效。"
-            f"跳过发送步骤，请更新 GitHub Secret 中的 Cookie"
-        )
-        context.close()
-        return
-
-    # 等待会话列表条目出现（UI 发送的必要条件）
+    # ========== 等待会话列表加载 ==========
     try:
         page.wait_for_selector(CONVERSATION_ITEM_SELECTOR, timeout=30000)
         item_count = page.locator(CONVERSATION_ITEM_SELECTOR).count()
@@ -1091,127 +1086,84 @@ def do_user_task(browser, username, cookies, targets):
     except Exception:
         logger.warning("会话列表条目未出现，可能页面未完全加载或 Cookie 失效")
 
-    # 滚动会话列表收集好友信息
-    scroll_conversation_list(page, username)
-
-    # 记录捕获到的 API 调用
-    if captured_api_urls:
-        logger.info(f"页面共调用了 {len(captured_api_urls)} 个 API")
-        for api_url in captured_api_urls[:20]:
-            logger.debug(f"  API: {api_url[:150]}")
-    else:
-        logger.warning("页面未调用任何 aweme/im API，可能页面未完全加载或 Cookie 已过期")
-    captured_api_urls = []
-    logger.info(f"账号 {username} 共收集到 {len(userIDDict)} 个好友信息")
-
-    # 提取当前用户信息
-    extract_user_info_from_page(page)
-
-    # 如果没有收集到好友信息，尝试通过 API 获取
-    if not userIDDict:
-        logger.warning(f"账号 {username} 未通过滚动收集到好友信息，尝试通过 API 获取")
-        try:
-            fetch_friends_via_api(page)
-        except Exception as e:
-            logger.warning(f"通过 API 获取好友信息失败: {e}")
-
-    # 如果 API 也失败，尝试从 DOM/JS 状态提取
-    if not userIDDict:
-        logger.warning(f"账号 {username} API 获取也失败，尝试从 DOM/JS 状态提取")
-        try:
-            extract_friends_from_dom(page)
-        except Exception as e:
-            logger.warning(f"从 DOM 提取好友信息失败: {e}")
-
-    # 记录未出现在收集信息中的目标（仅提示；UI 发送阶段按会话标题匹配，群聊也可匹配）
-    found_names = {info.get("remark_name") for info in userIDDict.values() if info.get("uid")}
-    not_in_collected = [t for t in targets if t not in found_names]
-    if not_in_collected:
-        logger.info(
-            f"账号 {username} 有 {len(not_in_collected)} 个目标未在收集到的好友信息中: {not_in_collected}，"
-            f"发送阶段将按会话标题匹配"
-        )
-
-    logger.info(f"账号 {username} 最终收集到 {len(userIDDict)} 个好友信息")
-
-    # ========== 阶段2: 页面原生 UI 发送消息 ==========
-    # 会话列表回到顶部（收集阶段已滚动到底部）
-    for selector in CONVERSATION_LIST_SELECTORS:
-        try:
-            el = page.locator(selector).element_handle()
-            if el:
-                page.evaluate("(e) => { e.scrollTop = 0; }", el)
-                logger.debug(f"会话列表已回到顶部 ({selector})")
-                break
-        except Exception:
-            continue
-    time.sleep(2)
-
-    def _resolve_editor():
-        """定位可编辑的聊天输入框（容器本身或其内部 contenteditable）"""
-        loc = page.locator(CHAT_EDITOR_SELECTOR)
-        if loc.count() == 0:
-            return None
-        first = loc.first
-        try:
-            if first.evaluate("e => e.isContentEditable"):
-                return first
-        except Exception:
-            pass
-        for sel in [
-            f'{CHAT_EDITOR_SELECTOR} [contenteditable="true"]',
-            '[contenteditable="true"]',
-        ]:
-            try:
-                inner = page.locator(sel)
-                if inner.count() > 0:
-                    return inner.first
-            except Exception:
-                continue
-        return first
-
+    # ========== 阶段4: 查找并点击好友，发送消息 ==========
     message = build_message()
     logger.info(f"账号 {username} 消息内容: {message}")
 
     sent_targets = []
+    failed_targets = []
+
     try:
-        for target_symbol in scroll_and_select_user(page, username, targets):
-            # 等待聊天编辑器出现
-            try:
-                page.wait_for_selector(CHAT_EDITOR_SELECTOR, timeout=30000)
-            except Exception:
-                logger.warning(f"账号 {username} 聊天编辑器未出现，跳过 {target_symbol}")
+        for target_name in scroll_and_select_user(page, username, targets):
+            # 等待聊天输入框出现
+            chat_input = None
+            for sel in [
+                '[contenteditable="true"]',
+                '.chat-input-dccKiL',
+                CHAT_EDITOR_SELECTOR,
+                '[class*="chat-input"]',
+                '[class*="editor"] [contenteditable]',
+            ]:
                 try:
-                    import os
-                    os.makedirs("logs", exist_ok=True)
-                    page.screenshot(path="logs/editor_missing.png", full_page=False, timeout=10000)
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        chat_input = loc.first
+                        chat_input.click()
+                        time.sleep(1)
+                        logger.debug(f"找到聊天输入框: {sel}")
+                        break
+                except Exception:
+                    continue
+
+            if chat_input is None:
+                logger.warning(f"账号 {username} 未找到聊天输入框，跳过 {target_name}")
+                try:
+                    page.screenshot(path=f"logs/no_input_{target_name}.png", full_page=False, timeout=10000)
                 except Exception:
                     pass
                 continue
 
-            chat_input = _resolve_editor()
-            if chat_input is None:
-                logger.warning(f"账号 {username} 未找到可编辑的输入框，跳过 {target_symbol}")
-                continue
-
-            # 兼容真实换行符与字面 \n 转义
+            # 用 keyboard 级别输入（对 emoji 更可靠）
             lines = message.replace("\r\n", "\n").replace("\\n", "\n").split("\n")
             for i, line in enumerate(lines):
                 if line:
-                    chat_input.type(line)
+                    page.keyboard.type(line, delay=50)
                 if i < len(lines) - 1:
-                    chat_input.press("Shift+Enter")
-            chat_input.press("Enter")
+                    page.keyboard.press("Shift+Enter")
+                    time.sleep(0.3)
+
+            time.sleep(0.5)
+
+            # 发送消息
+            page.keyboard.press("Enter")
             time.sleep(2)
 
-            sent_targets.append(target_symbol)
-            logger.info(f"✅ 账号 {username} 已通过页面发送消息给 {target_symbol}")
+            # 验证消息是否出现在聊天区域
+            verified = False
+            try:
+                page.wait_for_timeout(500)
+                chat_area_text = page.evaluate("""
+                    () => {
+                        const msgs = document.querySelectorAll('[class*="message-content"], [class*="msg-content"], [class*="bubble"]');
+                        return Array.from(msgs).slice(-5).map(m => m.innerText || m.textContent || '').join(' | ');
+                    }
+                """)
+                if message.strip() in chat_area_text or any(message.strip() in m for m in chat_area_text.split(' | ')):
+                    verified = True
+                    logger.info(f"✅ 账号 {username} 已发送并验证消息给 {target_name}")
+                else:
+                    logger.debug(f"聊天区域文本（末5条）: {chat_area_text[:300]}")
+            except Exception:
+                pass
+
+            if not verified:
+                logger.info(f"✅ 账号 {username} 已发送消息给 {target_name}（未验证）")
+
+            sent_targets.append(target_name)
     except Exception as e:
-        logger.error(f"❌ 账号 {username} UI 发送阶段出错: {e}")
+        logger.error(f"❌ 账号 {username} 发送阶段出错: {e}")
         traceback.print_exc()
         try:
-            import os
-            os.makedirs("logs", exist_ok=True)
             page.screenshot(path="logs/send_error.png", full_page=False, timeout=10000)
         except Exception:
             pass
@@ -1223,13 +1175,13 @@ def do_user_task(browser, username, cookies, targets):
         logger.warning(f"账号 {username} 未找到 {len(missing)} 个目标的会话: {missing}")
     logger.info(f"账号 {username} 发送完成: 成功 {len(sent_targets)}/{len(targets)}")
 
-    # 保存最终截图（调试用）
+    # 保存最终截图
     try:
         import os
         os.makedirs("logs", exist_ok=True)
         page.screenshot(path="logs/chat_after_send.png", full_page=False, timeout=10000)
-    except Exception as e:
-        logger.debug(f"截图失败: {e}")
+    except Exception:
+        pass
 
     context.close()
     logger.info(f"账号 {username} 任务完成")
@@ -1283,6 +1235,7 @@ def scroll_and_select_user(page, username, targets):
                 targetSymbol = checkTargetName(targetName, targets)
                 if targetSymbol:
                     element.click()
+                    time.sleep(2)
                     yield targetSymbol
                     if targetSymbol in remaining_targets:
                         remaining_targets.remove(targetSymbol)
