@@ -19,7 +19,6 @@ jobs:
     permissions:
       actions: read
       contents: read
-      secrets: write
     steps:
       - uses: actions/checkout@v4
       - name: Check if already succeeded today
