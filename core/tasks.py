@@ -1056,7 +1056,7 @@ def do_user_task(browser, username, cookies, targets):
         except Exception:
             pass
         context.close()
-        return
+        return False
 
     # ========== Cookie 自动续期：提取刷新后的 Cookie ==========
     try:
@@ -1185,6 +1185,7 @@ def do_user_task(browser, username, cookies, targets):
 
     context.close()
     logger.info(f"账号 {username} 任务完成")
+    return True
 
 
 # ========== UI 会话选择辅助 ==========
@@ -1272,6 +1273,7 @@ def scroll_and_select_user(page, username, targets):
 
 def runTasks():
     playwright, browser = get_browser()
+    any_success = False
     try:
         logger.info("开始执行任务（UI 自动化模式）")
         logger.debug(f"消息模板: {config.get('messageTemplate', '未找到消息模板')}")
@@ -1284,8 +1286,15 @@ def runTasks():
             targets = user["targets"]
             username = user.get("username", "未知用户")
             logger.info(f"开始处理账号 {username}")
-            do_user_task(browser, username, cookies, targets)
+            result = do_user_task(browser, username, cookies, targets)
+            if result:
+                any_success = True
             logger.info(f"账号 {username} 任务完成")
     finally:
         browser.close()
         playwright.stop()
+
+    if not any_success:
+        logger.error("❌ 所有账号均未成功发送消息（Cookie 可能已过期），退出码 1")
+        import sys
+        sys.exit(1)
