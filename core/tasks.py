@@ -1036,14 +1036,40 @@ def do_user_task(browser, username, cookies, targets):
     is_logged_in = True
     try:
         current_url = page.url
-        body_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
-        logger.debug(f"页面文本预览: {body_text[:200]}")
-        if "passport" in current_url or "login" in current_url.lower():
+        body_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 1000) : ''")
+        logger.debug(f"页面文本预览: {body_text[:300]}")
+        if "passport" in current_url or "/login" in current_url.lower():
             logger.error(f"页面跳转到登录页: {current_url}，Cookie 已失效！")
             is_logged_in = False
-        if "扫码登录" in body_text or "验证码登录" in body_text:
-            logger.error("❌ 页面显示登录弹窗，Cookie 已失效！")
-            is_logged_in = False
+        elif "扫码登录" in body_text or "验证码登录" in body_text:
+            logger.warning("⚠️ 页面出现登录弹窗，尝试关闭...")
+            try:
+                page.keyboard.press("Escape")
+                time.sleep(1)
+                page.evaluate("""() => {
+                    const overlays = document.querySelectorAll('[class*="modal"], [class*="overlay"], [class*="mask"], [class*="dialog"]');
+                    overlays.forEach(el => { if (el.style) el.style.display = 'none'; });
+                    const closeBtns = document.querySelectorAll('[class*="close"], [class*="Close"]');
+                    closeBtns.forEach(btn => { try { btn.click(); } catch(e) {} });
+                }""")
+                time.sleep(2)
+                body_text2 = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
+                if "扫码登录" in body_text2 or "验证码登录" in body_text2:
+                    logger.warning("⚠️ 登录弹窗仍存在，检查会话列表是否可用...")
+                    conv_count = 0
+                    try:
+                        conv_count = page.locator(CONVERSATION_ITEM_SELECTOR).count()
+                    except Exception:
+                        pass
+                    if conv_count > 0:
+                        logger.info(f"✅ 会话列表可用（{conv_count} 个），继续发送")
+                    else:
+                        logger.error("❌ 登录弹窗无法关闭且会话列表为空")
+                        is_logged_in = False
+                else:
+                    logger.info("✅ 登录弹窗已关闭")
+            except Exception as e:
+                logger.debug(f"关闭弹窗失败: {e}")
     except Exception as e:
         logger.debug(f"检测登录状态失败: {e}")
 
