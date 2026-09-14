@@ -1036,6 +1036,7 @@ def do_user_task(browser, username, cookies, targets):
     except Exception:
         pass
     # 检测登录状态（URL 跳转到 passport 说明 Cookie 失效）
+    login_state = {"isLoggedIn": False}
     try:
         current_url = page.url
         if "passport" in current_url or "login" in current_url:
@@ -1072,6 +1073,15 @@ def do_user_task(browser, username, cookies, targets):
             )
     except Exception:
         pass
+
+    # 检测到未登录时提前退出，避免后续步骤空转浪费时间
+    if not login_state.get("isLoggedIn"):
+        logger.error(
+            f"❌ 账号 {username} 未登录（isLoggedIn=False），Cookie 已失效。"
+            f"跳过发送步骤，请更新 GitHub Secret 中的 Cookie"
+        )
+        context.close()
+        return
 
     # 等待会话列表条目出现（UI 发送的必要条件）
     try:
