@@ -47,12 +47,23 @@ def handle_websocket(ws):
     监听页面自身的 WebSocket 连接，捕获 IM 连接 URL
     （其中包含服务端认可的 device_id / token / access_key）
     """
-    global captured_ws_url
+    global captured_ws_url, myUserInfo
     try:
         url = ws.url
         if ("frontier" in url or "im" in url.lower()) and url.startswith("wss://"):
             captured_ws_url = url
             logger.info(f"捕获到页面 IM WebSocket 连接: {url[:180]}")
+            # 从 WebSocket URL 中提取 device_id
+            try:
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query)
+                ws_device_id = qs.get("device_id", [""])[0]
+                if ws_device_id and ws_device_id != "0":
+                    myUserInfo["device_id"] = ws_device_id
+                    logger.debug(f"从 WebSocket URL 提取到 device_id: {ws_device_id}")
+            except Exception:
+                pass
     except Exception as e:
         logger.debug(f"捕获 WebSocket 连接失败: {e}")
 
@@ -144,13 +155,13 @@ def handle_response(response: Response):
             status_code = json_data.get("status_code", None)
             # user_uid 是用户 UID；id 可能是设备 ID（未登录时也会返回）
             uid = (
-                json_data.get("uid", "") or
                 json_data.get("user_uid", "") or
+                json_data.get("uid", "") or
                 json_data.get("user", {}).get("uid", "") or
                 json_data.get("user", {}).get("id", "") or
                 json_data.get("id", "")
             )
-            if uid:
+            if uid and str(uid) != "0":
                 myUserInfo["uid"] = str(uid)
                 logger.debug(f"捕获到当前用户 uid: {uid} (status_code={status_code})")
             # device_id 从专门字段获取
@@ -390,15 +401,15 @@ def fetch_friends_via_api(page):
             const baseParams = 'device_platform=web&aid=6383&channel=channel_pc_web&pc_client_version=1.0.0&cookie_enabled=true&browser_language=zh-CN';
             const apis = [
                 {
-                    url: '/aweme/v1/web/im/conversation/list/',
+                    url: '/aweme/v1/web/im/conversation/list',
                     params: 'inbox_type=0&cursor=0&limit=50&' + baseParams,
                 },
                 {
-                    url: '/aweme/v1/web/im/conversation/list/',
+                    url: '/aweme/v1/web/im/conversation/list',
                     params: 'inbox_type=1&cursor=0&limit=50&' + baseParams,
                 },
                 {
-                    url: '/aweme/v1/web/im/conversation/list/',
+                    url: '/aweme/v1/web/im/conversation/list',
                     params: 'inbox_type=0&cursor=0&limit=100&' + baseParams,
                 },
             ];
@@ -640,10 +651,10 @@ def extract_user_info_from_page(page):
                 return info;
             }
         """)
-        if result.get("uid"):
+        if result.get("uid") and str(result["uid"]) != "0":
             myUserInfo["uid"] = str(result["uid"])
             logger.debug(f"从页面 JS 提取到 uid: {result['uid']}")
-        if result.get("deviceId"):
+        if result.get("deviceId") and str(result["deviceId"]) != "0":
             myUserInfo["device_id"] = str(result["deviceId"])
             logger.debug(f"从页面 JS 提取到 device_id: {result['deviceId']}")
     except Exception as e:
@@ -680,12 +691,13 @@ def extract_user_info_from_page(page):
 
                 # id 字段是用户 UID（不是 device_id）
                 uid = (
+                    data.get("user_uid", "") or
                     data.get("uid", "") or
                     data.get("user", {}).get("uid", "") or
-                    data.get("id", "") or
-                    data.get("user", {}).get("id", "")
+                    data.get("user", {}).get("id", "") or
+                    data.get("id", "")
                 )
-                if uid:
+                if uid and str(uid) != "0":
                     myUserInfo["uid"] = str(uid)
                     logger.debug(f"从 API 获取到 uid: {uid}")
 
@@ -747,66 +759,23 @@ def find_target_uid(target, cookies):
 
 
 def search_friend_by_name(page, target_name):
-    """通过抖音搜索查找好友 uid：先试聊天页搜索框，失败则用主站搜索页"""
+    """通过抖音主站搜索页查找好友 uid（跳过聊天页搜索，避免 IP 风控超时）"""
     global userIDDict
     logger.info(f"尝试搜索好友: {target_name}")
 
-    # ---- 方式1: 聊天页面搜索框 ----
-    try:
-        search_selectors = [
-            'input[placeholder*="搜索"]',
-            'input[placeholder*="search"]',
-            'input[placeholder*="查找"]',
-            '[class*="search"] input',
-        ]
-
-        search_input = None
-        for selector in search_selectors:
-            try:
-                search_input = page.query_selector(selector)
-                if search_input:
-                    logger.debug(f"找到搜索输入框: {selector}")
-                    break
-            except Exception:
-                continue
-
-        if search_input:
-            search_input.click()
-            search_input.fill("")
-            search_input.type(target_name)
-            time.sleep(3)
-            time.sleep(2)  # 等待搜索 API 响应被 handle_response 捕获
-
-            for remark_name, info in userIDDict.items():
-                if target_name in [info["remark_name"], info["nickname"]]:
-                    uid = info.get("uid", "")
-                    if uid:
-                        logger.info(f"聊天页搜索找到好友 {target_name} (uid={uid})")
-                        return uid, info
-
-            # 清空搜索框
-            try:
-                search_input.fill("")
-                time.sleep(1)
-            except Exception:
-                pass
-        else:
-            logger.debug("聊天页未找到搜索输入框")
-    except Exception as e:
-        logger.debug(f"聊天页搜索 {target_name} 失败: {e}")
-
-    # ---- 方式2: 抖音主站搜索页（页面自带 X-Bogus 签名）----
+    # ---- 直接使用主站搜索页（页面自带 X-Bogus 签名）----
+    # 跳过聊天页搜索框（在 GitHub Actions US IP 上会超时）
     try:
         from urllib.parse import quote
         search_url = f"https://www.douyin.com/search/{quote(target_name)}?type=user"
         before_count = len([v for v in userIDDict.values() if v.get("uid")])
 
-        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
         try:
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
             pass
-        time.sleep(5)  # 等待搜索结果渲染和 API 响应
+        time.sleep(2)  # 等待搜索结果渲染和 API 响应
 
         # handle_response 会解析搜索 API 响应并填充 userIDDict
         # 搜索页是 SSR 渲染，结果直接嵌在 __INITIAL_STATE__ 中，也提取一份
@@ -868,13 +837,6 @@ def search_friend_by_name(page, target_name):
 
         new_count = len([v for v in userIDDict.values() if v.get("uid")])
         logger.debug(f"主站搜索后新增 {new_count - before_count} 个用户，但无精确匹配 {target_name}")
-
-        # 回到主站首页（避免导航到聊天页触发 IP 风控）
-        try:
-            page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(2)
-        except Exception:
-            pass
     except Exception as e:
         logger.debug(f"主站搜索 {target_name} 失败: {e}")
 
@@ -952,17 +914,17 @@ def try_send_via_ws(page, context, cookies, username, targets):
     message = build_message()
     logger.info(f"账号 {username} WebSocket 消息内容: {message}")
 
-    # 1. 尝试通过 API 获取会话列表
+    # 1. 尝试通过 API 获取会话列表（可能因缺少 X-Bogus 签名而失败）
     fetch_friends_via_api(page)
-    logger.info(f"API 获取到 {len(userIDDict)} 个好友信息")
+    logger.info(f"API + handle_response 获取到 {len(userIDDict)} 个好友信息")
 
     # 2. 搜索未找到的好友
     remaining = [t for t in targets if not find_target_uid(t, cookies)[0]]
     if remaining:
-        logger.info(f"需要搜索的好友: {remaining}")
+        logger.info(f"需要搜索的好友: {remaining} (共 {len(remaining)} 个)")
         for target in remaining:
             search_friend_by_name(page, target)
-            time.sleep(1)
+            time.sleep(0.5)
 
     # 3. 检查目标好友的 uid
     target_uids = {}
@@ -1081,10 +1043,12 @@ def do_user_task(browser, username, cookies, targets):
         page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
-    time.sleep(5)
+    time.sleep(3)  # 等待 API 响应和 WebSocket 连接被捕获
 
     # 从页面提取当前用户信息（uid, device_id）
-    extract_user_info_from_page(page)
+    # 仅在 handle_response 未捕获到有效 uid 时才从页面提取
+    if not myUserInfo.get("uid") or str(myUserInfo.get("uid")) == "0":
+        extract_user_info_from_page(page)
     logger.info(f"捕获到当前用户: uid={myUserInfo.get('uid')}, device_id={myUserInfo.get('device_id')}")
     if captured_ws_url:
         logger.info(f"捕获到页面 WebSocket: {captured_ws_url[:120]}")
