@@ -30,7 +30,7 @@ jobs:
           TODAY_BEIJING=$(date +%F)
           TODAY_UTC=$(date -u -d "${TODAY_BEIJING}T00:00:00+08:00" +%Y-%m-%dT%H:%M:%SZ)
           export TODAY_UTC
-          COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "run-logs") | select(.created_at >= env.TODAY_UTC)] | length')
+          COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name == "success-marker") | select(.created_at >= env.TODAY_UTC)] | length')
           echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
           echo "Beijing today(${TODAY_BEIJING}) count: ${COUNT}"
       - name: Set up Python
@@ -41,7 +41,7 @@ jobs:
       - name: Test Douyin Accessibility
         if: steps.check.outputs.count == '0'
         run: |
-          curl -I https://creator.douyin.com/
+          curl -I https://www.douyin.com/
       - name: Install dependencies
         if: steps.check.outputs.count == '0'
         run: |
@@ -60,10 +60,18 @@ jobs:
         if: steps.check.outputs.count == '0'
         run: python main.py
       - uses: actions/upload-artifact@v4
-        if: ${{ success() && steps.check.outputs.count == '0' }}
+        if: ${{ !cancelled() && steps.check.outputs.count == '0' }}
         with:
           name: run-logs
           path: logs/
+      - name: Create success marker
+        if: ${{ success() && steps.check.outputs.count == '0' }}
+        run: echo "success" > logs/success-marker.txt
+      - uses: actions/upload-artifact@v4
+        if: ${{ success() && steps.check.outputs.count == '0' }}
+        with:
+          name: success-marker
+          path: logs/success-marker.txt
 
       - name: Auto-refresh Cookie Secret
         if: ${{ success() && steps.check.outputs.count == '0' }}

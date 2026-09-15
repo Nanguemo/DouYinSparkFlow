@@ -4,9 +4,11 @@ from utils.config import get_config, get_userData
 from utils import norm
 from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
+from core.ws_client import DouyinWSClient
 from playwright.sync_api import Response
 import time
 import json
+import os
 
 config = get_config()
 userData = get_userData()
@@ -867,10 +869,10 @@ def search_friend_by_name(page, target_name):
         new_count = len([v for v in userIDDict.values() if v.get("uid")])
         logger.debug(f"主站搜索后新增 {new_count - before_count} 个用户，但无精确匹配 {target_name}")
 
-        # 回到聊天页，保持后续流程的页面状态
+        # 回到主站首页（避免导航到聊天页触发 IP 风控）
         try:
-            page.goto("https://www.douyin.com/chat", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(3)
+            page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
         except Exception:
             pass
     except Exception as e:
@@ -940,20 +942,94 @@ def search_friends_via_api(page, targets):
     return found_count
 
 
+def try_send_via_ws(page, context, cookies, username, targets):
+    """
+    尝试通过 WebSocket 发送消息（绕过聊天页 IP 风控）
+    返回 True 表示成功发送，False 表示发送失败，None 表示无法尝试（需要 fallback）
+    """
+    global userIDDict, myUserInfo, captured_ws_url
+
+    message = build_message()
+    logger.info(f"账号 {username} WebSocket 消息内容: {message}")
+
+    # 1. 尝试通过 API 获取会话列表
+    fetch_friends_via_api(page)
+    logger.info(f"API 获取到 {len(userIDDict)} 个好友信息")
+
+    # 2. 搜索未找到的好友
+    remaining = [t for t in targets if not find_target_uid(t, cookies)[0]]
+    if remaining:
+        logger.info(f"需要搜索的好友: {remaining}")
+        for target in remaining:
+            search_friend_by_name(page, target)
+            time.sleep(1)
+
+    # 3. 检查目标好友的 uid
+    target_uids = {}
+    for target in targets:
+        uid, info = find_target_uid(target, cookies)
+        if uid:
+            target_uids[target] = uid
+        else:
+            logger.warning(f"未能找到好友 {target} 的 uid")
+
+    if not target_uids:
+        logger.error("未能找到任何目标好友的 uid，WebSocket 发送无法进行")
+        return None
+
+    logger.info(f"找到 {len(target_uids)}/{len(targets)} 个目标好友的 uid: {target_uids}")
+
+    # 4. 连接 WebSocket 并发送消息
+    try:
+        ws_client = DouyinWSClient(
+            cookies=cookies,
+            device_id=myUserInfo.get("device_id", ""),
+            myid=myUserInfo["uid"],
+            captured_ws_url=captured_ws_url,
+        )
+        ws_client.connect(timeout=15)
+
+        sent_count = 0
+        for target, uid in target_uids.items():
+            try:
+                success = ws_client.send_message(uid, message)
+                if success:
+                    sent_count += 1
+                    logger.info(f"✅ WebSocket 发送成功: {target} (uid={uid})")
+                else:
+                    logger.warning(f"⚠️ WebSocket 发送状态异常: {target} (uid={uid})")
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"发送给 {target} 失败: {e}")
+
+        ws_client.close()
+
+        if sent_count > 0:
+            logger.info(f"账号 {username} WebSocket 发送完成: 成功 {sent_count}/{len(target_uids)}")
+            return True
+        else:
+            logger.error(f"账号 {username} WebSocket 发送全部失败")
+            return False
+    except Exception as e:
+        logger.error(f"WebSocket 连接/发送失败: {e}")
+        traceback.print_exc()
+        return None
+
+
 def do_user_task(browser, username, cookies, targets):
     """
-    UI 自动化方式发送消息：
-    1. 用浏览器打开抖音创作者中心（带反无头检测），激活 Cookie
-    2. 导航到消息页面，滚动列表查找目标好友
-    3. 点击会话，用 keyboard 级别输入消息并发送
-    4. 发送后验证消息是否出现在聊天区域
+    发送续火花消息（WebSocket 优先，UI 作为 fallback）：
+    1. 用浏览器打开抖音主页（www.douyin.com），激活 Cookie，捕获 uid/device_id/WebSocket URL
+    2. 通过 API 获取会话列表，搜索未找到的好友
+    3. 通过 WebSocket + Protobuf 直接发送私信（绕过聊天页 IP 风控）
+    4. 若 WebSocket 失败，fallback 到 UI 方式（导航聊天页 + 键盘输入）
     5. 提取刷新后的 Cookie 保存到文件（供自动续期）
     """
-    global userIDDict, myUserInfo
+    global userIDDict, myUserInfo, captured_ws_url, captured_api_urls
     userIDDict = {}
     myUserInfo = {}
-    global captured_ws_url
     captured_ws_url = None
+    captured_api_urls = []
 
     # ========== 阶段1: 浏览器设置 ==========
     context = browser.new_context(
@@ -992,28 +1068,68 @@ def do_user_task(browser, username, cookies, targets):
             f"请重新导出完整 Cookie 并更新 GitHub Secret"
         )
 
-    # ========== 阶段2: 打开抖音主页（激活 Cookie）==========
+    # ========== 阶段2: 打开抖音主页（激活 Cookie + 捕获认证信息）==========
     retry_operation(
         "打开抖音主页",
         page.goto,
         retries=config["taskRetryTimes"],
         delay=5,
-        url="https://creator.douyin.com/",
+        url="https://www.douyin.com/",
         wait_until="domcontentloaded",
     )
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
-    time.sleep(3)
+    time.sleep(5)
 
-    # ========== 阶段3: 导航到聊天页面 ==========
+    # 从页面提取当前用户信息（uid, device_id）
+    extract_user_info_from_page(page)
+    logger.info(f"捕获到当前用户: uid={myUserInfo.get('uid')}, device_id={myUserInfo.get('device_id')}")
+    if captured_ws_url:
+        logger.info(f"捕获到页面 WebSocket: {captured_ws_url[:120]}")
+    logger.info(f"API 响应捕获: {len(captured_api_urls)} 个 API 调用")
+
+    # 检查登录状态（主页能捕获 uid 即说明 Cookie 有效）
+    if not myUserInfo.get("uid"):
+        logger.error(f"❌ 账号 {username} 未能捕获用户 uid，Cookie 可能已失效")
+        try:
+            os.makedirs("logs", exist_ok=True)
+            page.screenshot(path="logs/cookie_expired.png", full_page=False, timeout=10000)
+        except Exception:
+            pass
+        context.close()
+        return False
+
+    if not myUserInfo.get("device_id"):
+        myUserInfo["device_id"] = myUserInfo["uid"]
+        logger.debug(f"使用 uid 作为 device_id: {myUserInfo['uid']}")
+
+    # ========== Cookie 自动续期：提取刷新后的 Cookie ==========
+    try:
+        refreshed_cookies = context.cookies()
+        if refreshed_cookies and len(refreshed_cookies) >= len(cookies):
+            os.makedirs("logs", exist_ok=True)
+            with open("logs/refreshed_cookies.json", "w", encoding="utf-8") as f:
+                json.dump(refreshed_cookies, f, ensure_ascii=False)
+            logger.info(f"已保存 {len(refreshed_cookies)} 个刷新后的 Cookie 到 logs/refreshed_cookies.json")
+    except Exception as e:
+        logger.warning(f"提取刷新后的 Cookie 失败: {e}")
+
+    # ========== 阶段3: WebSocket 方式发送消息（绕过聊天页 IP 风控）==========
+    ws_result = try_send_via_ws(page, context, cookies, username, targets)
+    if ws_result is not None:
+        context.close()
+        return ws_result
+
+    # ========== 阶段4: UI 方式发送消息（fallback）==========
+    logger.info("WebSocket 方式未能发送消息，尝试 UI 方式（聊天页）...")
     retry_operation(
         "打开抖音聊天页面",
         page.goto,
         retries=config["taskRetryTimes"],
         delay=5,
-        url="https://creator.douyin.com/creator-micro/data/following/chat",
+        url="https://www.douyin.com/chat",
         wait_until="domcontentloaded",
     )
     logger.info(f"账号 {username} 聊天页面已打开，等待加载...")
@@ -1023,78 +1139,38 @@ def do_user_task(browser, username, cookies, targets):
         logger.warning("等待 networkidle 超时，继续执行")
     time.sleep(10)
 
-    # ========== 登录状态检测 ==========
-    global captured_api_urls
-    captured_api_urls = []
-    try:
-        logger.info(f"页面 URL: {page.url}")
-        logger.info(f"页面标题: {page.title()}")
-    except Exception:
-        pass
-
-    # 检测登录弹窗/跳转
+    # 检测登录弹窗
     is_logged_in = True
     try:
         current_url = page.url
         body_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 1000) : ''")
-        logger.debug(f"页面文本预览: {body_text[:300]}")
         if "passport" in current_url or "/login" in current_url.lower():
-            logger.error(f"页面跳转到登录页: {current_url}，Cookie 已失效！")
             is_logged_in = False
         elif "扫码登录" in body_text or "验证码登录" in body_text:
-            logger.warning("⚠️ 页面出现登录弹窗，尝试关闭...")
-            try:
-                page.keyboard.press("Escape")
-                time.sleep(1)
-                page.evaluate("""() => {
-                    const overlays = document.querySelectorAll('[class*="modal"], [class*="overlay"], [class*="mask"], [class*="dialog"]');
-                    overlays.forEach(el => { if (el.style) el.style.display = 'none'; });
-                    const closeBtns = document.querySelectorAll('[class*="close"], [class*="Close"]');
-                    closeBtns.forEach(btn => { try { btn.click(); } catch(e) {} });
-                }""")
-                time.sleep(2)
-                body_text2 = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
-                if "扫码登录" in body_text2 or "验证码登录" in body_text2:
-                    logger.warning("⚠️ 登录弹窗仍存在，检查会话列表是否可用...")
-                    conv_count = 0
-                    try:
-                        conv_count = page.locator(CONVERSATION_ITEM_SELECTOR).count()
-                    except Exception:
-                        pass
-                    if conv_count > 0:
-                        logger.info(f"✅ 会话列表可用（{conv_count} 个），继续发送")
-                    else:
-                        logger.error("❌ 登录弹窗无法关闭且会话列表为空")
-                        is_logged_in = False
-                else:
-                    logger.info("✅ 登录弹窗已关闭")
-            except Exception as e:
-                logger.debug(f"关闭弹窗失败: {e}")
-    except Exception as e:
-        logger.debug(f"检测登录状态失败: {e}")
+            page.keyboard.press("Escape")
+            time.sleep(1)
+            page.evaluate("""() => {
+                const overlays = document.querySelectorAll('[class*="modal"], [class*="overlay"], [class*="mask"], [class*="dialog"]');
+                overlays.forEach(el => { if (el.style) el.style.display = 'none'; });
+            }""")
+            time.sleep(2)
+            body_text2 = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
+            if "扫码登录" in body_text2 or "验证码登录" in body_text2:
+                conv_count = page.locator(CONVERSATION_ITEM_SELECTOR).count()
+                if conv_count == 0:
+                    is_logged_in = False
+    except Exception:
+        pass
 
     if not is_logged_in:
-        logger.error(f"❌ 账号 {username} Cookie 已失效，跳过发送，请更新 GitHub Secret 中的 Cookie")
+        logger.error(f"❌ 账号 {username} 聊天页 IP 风控，WebSocket 和 UI 均失败")
         try:
-            import os
             os.makedirs("logs", exist_ok=True)
-            page.screenshot(path="logs/cookie_expired.png", full_page=False, timeout=10000)
+            page.screenshot(path="logs/chat_ip_blocked.png", full_page=False, timeout=10000)
         except Exception:
             pass
         context.close()
         return False
-
-    # ========== Cookie 自动续期：提取刷新后的 Cookie ==========
-    try:
-        refreshed_cookies = context.cookies()
-        if refreshed_cookies and len(refreshed_cookies) >= len(cookies):
-            import os
-            os.makedirs("logs", exist_ok=True)
-            with open("logs/refreshed_cookies.json", "w", encoding="utf-8") as f:
-                json.dump(refreshed_cookies, f, ensure_ascii=False)
-            logger.info(f"已保存 {len(refreshed_cookies)} 个刷新后的 Cookie 到 logs/refreshed_cookies.json")
-    except Exception as e:
-        logger.warning(f"提取刷新后的 Cookie 失败: {e}")
 
     # ========== 截图调试 ==========
     try:
@@ -1301,7 +1377,7 @@ def runTasks():
     playwright, browser = get_browser()
     any_success = False
     try:
-        logger.info("开始执行任务（UI 自动化模式）")
+        logger.info("开始执行任务（WebSocket 优先，UI fallback）")
         logger.debug(f"消息模板: {config.get('messageTemplate', '未找到消息模板')}")
         logger.debug(f"一言类型: {config['hitokotoTypes']}")
         for user in userData:
