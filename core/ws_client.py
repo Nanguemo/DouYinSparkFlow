@@ -289,12 +289,17 @@ class DouyinWSClient:
         if not self.sessionid:
             logger.warning("Cookie 中缺少 sessionid/sessionid_ss，WebSocket 认证 token 为空，消息大概率无法发送")
 
-        # 如果浏览器阶段捕获了页面自身的 WS URL，直接复用其认证参数
+        # 如果浏览器阶段捕获了页面自身的 WS URL，直接复用其主机/路径/认证参数，
+        # 确保连接目标与页面实际成功连接的 WebSocket 完全一致。
         self.captured_ws_url = captured_ws_url
+        self._captured_host = None
+        self._captured_path = None
         if captured_ws_url:
             try:
-                from urllib.parse import urlparse, parse_qs
+                from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
                 parsed = urlparse(captured_ws_url)
+                self._captured_host = parsed.netloc
+                self._captured_path = parsed.path or "/ws/v2"
                 qs = parse_qs(parsed.query)
                 cap_device_id = (qs.get("device_id") or [""])[0]
                 cap_token = (qs.get("token") or [""])[0]
@@ -305,9 +310,18 @@ class DouyinWSClient:
                     self.sessionid = cap_token
                 if cap_access_key:
                     self.access_key = cap_access_key
-                logger.info(f"复用页面 WS 认证参数: device_id={self.device_id}, token={self.sessionid[:8]}***")
+                # 保留原 URL 的其它关键参数（device_platform/version_code/fpid/aid）
+                self._captured_extra_params = {
+                    k: v[0] for k, v in qs.items()
+                    if k not in ("device_id", "token", "access_key")
+                }
+                logger.info(
+                    f"复用页面 WS 认证参数: host={self._captured_host}, "
+                    f"device_id={self.device_id}, token={self.sessionid[:8]}***"
+                )
             except Exception as e:
                 logger.warning(f"解析捕获的 WS URL 失败，使用默认参数: {e}")
+                self._captured_host = None
 
         self.ws = None
         self._connected = False
@@ -316,6 +330,16 @@ class DouyinWSClient:
 
     @property
     def ws_url(self) -> str:
+        if self._captured_host:
+            params = dict(self._captured_extra_params)
+            params.update({
+                "device_id": self.device_id,
+                "token": self.sessionid,
+                "access_key": self.access_key,
+            })
+            query = urlencode(params)
+            return f"wss://{self._captured_host}{self._captured_path}?{query}"
+
         params = (
             f"aid=6383"
             f"&device_platform=douyin_pc"
