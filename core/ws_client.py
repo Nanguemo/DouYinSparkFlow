@@ -12,6 +12,7 @@ import uuid
 import struct
 import logging
 import websocket
+from urllib.parse import urlparse, parse_qs, urlencode
 
 logger = logging.getLogger(__name__)
 
@@ -296,7 +297,6 @@ class DouyinWSClient:
         self._captured_path = None
         if captured_ws_url:
             try:
-                from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
                 parsed = urlparse(captured_ws_url)
                 self._captured_host = parsed.netloc
                 self._captured_path = parsed.path or "/ws/v2"
