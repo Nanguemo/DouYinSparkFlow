@@ -16,6 +16,25 @@ config = None
 userData = None
 
 
+def load_target_uids_map():
+    """
+    加载仓库内硬编码的好友 uid 映射文件（utils/target_uids.json）。
+    结构: {"用户名": {好友名: "数字uid", ...}}
+    由于从 US IP 访问会话列表 API 会被风控（404 Janus），WebSocket
+    发送依赖该映射获取目标的数字 uid，无需再拉取会话列表。
+    """
+    path = os.path.join(os.path.dirname(__file__), "target_uids.json")
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        logger.warning("加载 target_uids.json 失败", exc_info=True)
+    return {}
+
+
 class Environment(Enum):
     GITHUBACTION = "GITHUB_ACTION"  # GitHub Action 运行
     LOCAL = "LOCAL"  # 本地代码运行
@@ -87,6 +106,8 @@ def get_userData():
 
     userData = []
 
+    file_uids = load_target_uids_map()  # 仓库内硬编码 uid 映射（用户名 -> 好友名 -> uid）
+
     for task in tasks:
         username = task.get("username", "未知用户")
         unique_id = task.get("unique_id")
@@ -106,12 +127,18 @@ def get_userData():
             logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
             continue
 
+        # 合并 uid：TASKS 内 task.target_uids 优先，其次仓库 utils/target_uids.json 里的映射
+        merged_uids = dict(file_uids.get(username, {}) or {})
+        merged_uids.update(task.get("target_uids", {}) or {})
+
         userData.append(
             {
                 "unique_id": unique_id,
                 "username": username,
                 "cookies": sanitize_cookies(cookies),
                 "targets": [norm(t) for t in task.get("targets", [])], # 标准化目标列表
+                # 硬编码的好友名 -> 数字 uid 映射（绕过从 US IP 被风控的会话列表 API）。
+                "target_uids": merged_uids,
             }
         )
 

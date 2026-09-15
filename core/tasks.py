@@ -914,21 +914,37 @@ def try_send_via_ws(page, context, cookies, username, targets):
     message = build_message()
     logger.info(f"账号 {username} WebSocket 消息内容: {message}")
 
-    # 1. 尝试通过 API 获取会话列表（可能因缺少 X-Bogus 签名而失败）
+    # 0. 优先使用硬编码的目标 uid 映射（会话列表 API 从 US IP 会被风控返回 404）
+    hardcoded_uids = {}
+    for u in userData:
+        if u.get("username") == username:
+            hardcoded_uids = u.get("target_uids", {}) or {}
+            break
+    if hardcoded_uids:
+        logger.info(f"使用配置中的硬编码 uid 映射: {hardcoded_uids}")
+
+    # 1. 尝试通过 API 获取会话列表（可能因缺少 X-Bogus 签名/IP 风控而失败）
     fetch_friends_via_api(page)
     logger.info(f"API + handle_response 获取到 {len(userIDDict)} 个好友信息")
 
-    # 2. 搜索未找到的好友
-    remaining = [t for t in targets if not find_target_uid(t, cookies)[0]]
+    # 2. 搜索未找到的好友（仅针对硬编码映射未覆盖、且未从 API 获取到的目标）
+    remaining = [
+        t for t in targets
+        if not hardcoded_uids.get(t)
+        and not find_target_uid(t, cookies)[0]
+    ]
     if remaining:
         logger.info(f"需要搜索的好友: {remaining} (共 {len(remaining)} 个)")
         for target in remaining:
             search_friend_by_name(page, target)
             time.sleep(0.5)
 
-    # 3. 检查目标好友的 uid
+    # 3. 汇总目标好友的 uid：硬编码映射优先，其次 API/搜索结果
     target_uids = {}
     for target in targets:
+        if hardcoded_uids.get(target):
+            target_uids[target] = str(hardcoded_uids[target])
+            continue
         uid, info = find_target_uid(target, cookies)
         if uid:
             target_uids[target] = uid
@@ -1138,7 +1154,6 @@ def do_user_task(browser, username, cookies, targets):
 
     # ========== 截图调试 ==========
     try:
-        import os
         os.makedirs("logs", exist_ok=True)
         page.screenshot(path="logs/chat_page_debug.png", full_page=False, timeout=10000)
     except Exception:
@@ -1243,7 +1258,6 @@ def do_user_task(browser, username, cookies, targets):
 
     # 保存最终截图
     try:
-        import os
         os.makedirs("logs", exist_ok=True)
         page.screenshot(path="logs/chat_after_send.png", full_page=False, timeout=10000)
     except Exception:
